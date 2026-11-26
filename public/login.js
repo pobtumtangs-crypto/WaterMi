@@ -44,7 +44,7 @@ async function handleGoogleAuth(event) {
   btn.setAttribute('aria-busy', 'true');
 
   try {
-    const res = await fetch('/api/auth/google', { method: 'POST' });
+    const res = await fetch('/api/auth/google', { method: 'POST', credentials: 'include' });
 
     const data = await res.json().catch(() => ({}));
 

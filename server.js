@@ -1,6 +1,6 @@
 import express from 'express';
 import session from 'express-session';
-import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomUUID, randomBytes, scryptSync, timingSafeEqual, createHash, createCipheriv, createDecipheriv } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -420,7 +420,7 @@ export function createApp({
   secureCookies = false,
   publicOrigin,
 } = {}) {
-  const store = openStore(dataDir);
+  const store = authClient ? null : openStore(dataDir);
   const ai = { fetch, apiKey };
   const fallbacks = analysisFallbackModel.split(',').map((m) => m.trim()).filter(Boolean);
   const analysisModels = [...new Set([analysisModel, ...fallbacks])];
@@ -433,38 +433,166 @@ export function createApp({
   const authEnabled = Boolean(authClient || localAuth);
   const localUsers = new Map();
   const refreshing = new Map();
+  const revokedTokens = new Map();
   const cookieName = 'leafwise.sid';
+  const cookieMaxAgeMs = 7 * 24 * 60 * 60 * 1000;
+  const cookieKey = createHash('sha256').update(sessionSecret || randomBytes(32)).digest();
 
   function passwordHash(password, salt) {
     return scryptSync(password, salt, 64);
+  }
+
+  function sealCookie(payload) {
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', cookieKey, iv);
+    const encrypted = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
+    return Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString('base64url');
+  }
+
+  function unsealCookie(value) {
+    if (typeof value !== 'string' || !value) return null;
+    try {
+      const buf = Buffer.from(value, 'base64url');
+      if (buf.length < 29) return null;
+      const decipher = createDecipheriv('aes-256-gcm', cookieKey, buf.subarray(0, 12));
+      decipher.setAuthTag(buf.subarray(12, 28));
+      const plain = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
+      const parsed = JSON.parse(plain);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function parseCookies(header) {
+    const cookies = {};
+    if (typeof header !== 'string') return cookies;
+    for (const part of header.split(';')) {
+      const eq = part.indexOf('=');
+      if (eq === -1) continue;
+      const key = part.slice(0, eq).trim();
+      const val = part.slice(eq + 1).trim();
+      if (key) {
+        try {
+          cookies[key] = decodeURIComponent(val);
+        } catch {
+          cookies[key] = val;
+        }
+      }
+    }
+    return cookies;
+  }
+
+  function cookieSessionMiddleware(req, res, next) {
+    const clearOpts = { httpOnly: true, secure: secureCookies, sameSite: 'lax', path: '/' };
+    const setOpts = { ...clearOpts, maxAge: cookieMaxAgeMs };
+    const state = unsealCookie(parseCookies(req.headers.cookie)[cookieName]) ?? {};
+    const resetState = () => {
+      for (const k of Object.keys(state)) delete state[k];
+    };
+    Object.defineProperties(state, {
+      save: {
+        value(cb) {
+          if (Object.keys(state).length) res.cookie(cookieName, sealCookie(state), setOpts);
+          else res.clearCookie(cookieName, clearOpts);
+          cb?.(null);
+        },
+      },
+      regenerate: {
+        value(cb) {
+          resetState();
+          cb?.(null);
+        },
+      },
+      destroy: {
+        value(cb) {
+          resetState();
+          res.clearCookie(cookieName, clearOpts);
+          cb?.(null);
+        },
+      },
+    });
+    req.session = state;
+    next();
+  }
+
+  function tokenExpiry(session) {
+    if (Number.isFinite(session?.expires_at)) return session.expires_at;
+    if (Number.isFinite(session?.expires_in)) return Math.floor(Date.now() / 1000) + session.expires_in;
+    try {
+      const payload = JSON.parse(Buffer.from(String(session?.access_token || '').split('.')[1] || '', 'base64url').toString('utf8'));
+      if (Number.isFinite(payload.exp)) return payload.exp;
+    } catch {
+      // Fall back to 1 hour if the token is not a JWT with an exp claim.
+    }
+    return Math.floor(Date.now() / 1000) + 3600;
+  }
+
+  function revokeToken(token, expiresAt) {
+    if (!token) return;
+    const now = Date.now();
+    for (const [k, exp] of revokedTokens) {
+      if (exp <= now) revokedTokens.delete(k);
+    }
+    revokedTokens.set(token, (expiresAt || Math.floor(now / 1000) + 3600) * 1000);
+  }
+
+  function isRevoked(token) {
+    const exp = revokedTokens.get(token);
+    if (!exp) return false;
+    if (exp <= Date.now()) {
+      revokedTokens.delete(token);
+      return false;
+    }
+    return true;
   }
 
   const saveSession = (req) => new Promise((resolve, reject) => {
     req.session.save((err) => err ? reject(err) : resolve());
   });
 
-  async function startSession(req, user, providerSession) {
-    await new Promise((resolve, reject) => {
-      req.session.regenerate((err) => err ? reject(err) : resolve());
-    });
-    req.session.user = {
+  function userSummary(user) {
+    return {
       id: user.id,
       email: user.email,
       name: user.user_metadata?.name || user.user_metadata?.full_name || user.name || user.email?.split('@')[0],
     };
-    req.session.providerSession = providerSession;
+  }
+
+  async function startSession(req, user, providerSession) {
+    await new Promise((resolve, reject) => {
+      req.session.regenerate((err) => err ? reject(err) : resolve());
+    });
+    req.session.user = userSummary(user);
+    if (providerSession) req.session.providerSession = providerSession;
     await saveSession(req);
   }
 
   function providerSession(session) {
     return {
       access_token: session.access_token,
-      refresh_token: session.refresh_token,
-      expires_at: session.expires_at,
+      refresh_token: session.refresh_token || '',
+      expires_at: tokenExpiry(session),
     };
   }
 
   async function loadSession(req, res, next) {
+    if (authClient && !req.session.user) {
+      const authHeader = req.get('authorization') || '';
+      const bearer = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
+      if (bearer) {
+        const token = bearer[1].trim();
+        if (!isRevoked(token)) {
+          const { data, error } = await authClient().auth.getUser(token);
+          if (!error && data?.user) {
+            req.user = userSummary(data.user);
+            req.db = authClient({ token });
+          }
+        }
+        return next();
+      }
+    }
+
     const user = req.session.user;
     if (!user) return next();
     if (!authClient) {
@@ -473,27 +601,42 @@ export function createApp({
     }
 
     let credentials = req.session.providerSession;
+    if (!credentials?.access_token || isRevoked(credentials.access_token)) {
+      delete req.session.user;
+      delete req.session.providerSession;
+      await saveSession(req);
+      return next();
+    }
     if (credentials.expires_at * 1000 <= Date.now() + 30_000) {
       const refreshToken = credentials.refresh_token;
-      let pending = refreshing.get(refreshToken);
-      if (!pending) {
-        pending = authClient().auth.refreshSession({ refresh_token: refreshToken });
-        refreshing.set(refreshToken, pending);
-      }
-      try {
-        const { data, error } = await pending;
-        if (error?.status >= 500) throw error;
-        if (error || !data.session) {
+      if (!refreshToken) {
+        if (credentials.expires_at * 1000 <= Date.now()) {
           delete req.session.user;
           delete req.session.providerSession;
           await saveSession(req);
           return next();
         }
-        credentials = providerSession(data.session);
-        req.session.providerSession = credentials;
-        await saveSession(req);
-      } finally {
-        refreshing.delete(refreshToken);
+      } else {
+        let pending = refreshing.get(refreshToken);
+        if (!pending) {
+          pending = authClient().auth.refreshSession({ refresh_token: refreshToken });
+          refreshing.set(refreshToken, pending);
+        }
+        try {
+          const { data, error } = await pending;
+          if (error?.status >= 500) throw error;
+          if (error || !data.session) {
+            delete req.session.user;
+            delete req.session.providerSession;
+            await saveSession(req);
+            return next();
+          }
+          credentials = providerSession(data.session);
+          req.session.providerSession = credentials;
+          await saveSession(req);
+        } finally {
+          refreshing.delete(refreshToken);
+        }
       }
     }
 
@@ -556,13 +699,17 @@ export function createApp({
 
   if (authEnabled) {
     if (secureCookies) app.set('trust proxy', 1);
-    app.use(session({
-      name: cookieName,
-      secret: sessionSecret || randomBytes(32).toString('hex'),
-      resave: false,
-      saveUninitialized: false,
-      cookie: { httpOnly: true, secure: secureCookies, sameSite: 'lax', maxAge: 7 * 24 * 60 * 60 * 1000 },
-    }));
+    if (authClient) {
+      app.use(cookieSessionMiddleware);
+    } else {
+      app.use(session({
+        name: cookieName,
+        secret: sessionSecret || randomBytes(32).toString('hex'),
+        resave: false,
+        saveUninitialized: false,
+        cookie: { httpOnly: true, secure: secureCookies, sameSite: 'lax', maxAge: cookieMaxAgeMs },
+      }));
+    }
     app.use((req, res, next) => {
       if (req.path === '/' || req.path === '/index.html' || req.path.startsWith('/api/') || req.path.startsWith('/photos/')) {
         res.set('Cache-Control', 'no-store');
@@ -582,7 +729,7 @@ export function createApp({
     app.use('/api/auth', onlySameOrigin);
     app.post('/api/auth/login', async (req, res) => {
       const { email, password } = credentialsFrom(req);
-      if (localAuth) {
+      if (localAuth && !authClient) {
         const user = localUsers.get(email) ?? createLocalUser(email, password);
         if (!timingSafeEqual(user.hash, passwordHash(password, user.salt))) {
           throw new ApiError(401, 'invalid_credentials', 'Invalid email or password.');
@@ -602,7 +749,7 @@ export function createApp({
       const { email, password } = credentialsFrom(req);
       if (password.length < 6) throw badRequest('Password must be at least 6 characters.');
       const name = text(req.body.name, 80);
-      if (localAuth) {
+      if (localAuth && !authClient) {
         if (localUsers.has(email)) throw badRequest('Email already registered.');
         const user = createLocalUser(email, password, name);
         await startSession(req, user);
@@ -629,19 +776,41 @@ export function createApp({
     });
 
     app.post('/api/auth/callback', requireAuthClient, async (req, res) => {
-      const { code } = req.body ?? {};
-      if (typeof code !== 'string' || !code || !req.session.oauth) {
-        throw badRequest('This sign-in link is invalid or expired. If you confirmed your email in another browser, return to sign in.');
+      const { code, tokenHash, type, accessToken, refreshToken } = req.body ?? {};
+      if (typeof code === 'string' && code) {
+        if (!req.session.oauth) {
+          throw badRequest('This sign-in link is invalid or expired. If you confirmed your email in another browser, return to sign in.');
+        }
+        const { data, error } = await authClient({ storage: oauthStorage(req) }).auth.exchangeCodeForSession(code);
+        if (error || !data.session) throw badRequest(error?.message || 'Sign-in could not be completed.');
+        await startSession(req, data.user, providerSession(data.session));
+        return res.json({ ok: true });
       }
-      const { data, error } = await authClient({ storage: oauthStorage(req) }).auth.exchangeCodeForSession(code);
-      if (error || !data.session) throw badRequest(error?.message || 'Sign-in could not be completed.');
-      await startSession(req, data.user, providerSession(data.session));
-      res.json({ ok: true });
+      if (typeof tokenHash === 'string' && tokenHash && typeof type === 'string' && type) {
+        const allowedTypes = ['signup', 'magiclink', 'recovery', 'invite', 'email', 'email_change'];
+        if (!allowedTypes.includes(type)) throw badRequest('Invalid verification type.');
+        const { data, error } = await authClient().auth.verifyOtp({ token_hash: tokenHash, type });
+        if (error || !data.session) throw badRequest(error?.message || 'Email verification could not be completed.');
+        await startSession(req, data.user, providerSession(data.session));
+        return res.json({ ok: true });
+      }
+      if (typeof accessToken === 'string' && accessToken) {
+        const { data, error } = await authClient().auth.getUser(accessToken);
+        if (error || !data?.user) throw badRequest(error?.message || 'This sign-in link is invalid or expired.');
+        await startSession(req, data.user, providerSession({
+          access_token: accessToken,
+          refresh_token: typeof refreshToken === 'string' ? refreshToken : '',
+        }));
+        return res.json({ ok: true });
+      }
+      throw badRequest('This sign-in link is invalid or expired. If you confirmed your email in another browser, return to sign in.');
     });
 
     app.post('/api/auth/logout', async (req, res) => {
-      const token = req.session.providerSession?.access_token;
+      const credentials = req.session.providerSession;
+      const token = credentials?.access_token;
       if (authClient && token) {
+        revokeToken(token, credentials.expires_at);
         try {
           const { error } = await authClient().auth.admin.signOut(token, 'local');
           if (error) console.error('Could not revoke session:', error.message);
@@ -652,7 +821,7 @@ export function createApp({
       await new Promise((resolve, reject) => {
         req.session.destroy((err) => err ? reject(err) : resolve());
       });
-      res.clearCookie(cookieName, { httpOnly: true, secure: secureCookies, sameSite: 'lax' });
+      res.clearCookie(cookieName, { httpOnly: true, secure: secureCookies, sameSite: 'lax', path: '/' });
       res.json({ ok: true });
     });
   }
@@ -679,15 +848,15 @@ export function createApp({
       for (const s of Object.values(sensors)) s.connected = false;
     }
     const { blynkToken: savedToken, userId, ...safePlant } = plant;
-    const usesEnvBlynk = Boolean(blynkToken && (!blynkPlantId ? store.plants()[0]?.id === plant.id : blynkPlantId === plant.id));
+    const usesEnvBlynk = Boolean(!authClient && blynkToken && (!blynkPlantId ? store.plants()[0]?.id === plant.id : blynkPlantId === plant.id));
     return { ...safePlant, blynkLinked: Boolean(savedToken || usesEnvBlynk), sensors };
   };
 
   const BLYNK_PINS = { v0: 'humidity', v1: 'temperature', v2: 'soilMoisture', v3: 'light' };
   const lastBlynkSyncByPlant = new Map();
 
-  async function syncPlantFromBlynk(plant, { force = false, save = store.save } = {}) {
-    const usesEnvBlynk = Boolean(blynkToken && (!blynkPlantId ? store.plants()[0]?.id === plant.id : blynkPlantId === plant.id));
+  async function syncPlantFromBlynk(plant, { force = false, save = () => store?.save() } = {}) {
+    const usesEnvBlynk = Boolean(!authClient && blynkToken && (!blynkPlantId ? store.plants()[0]?.id === plant.id : blynkPlantId === plant.id));
     const token = plant.blynkToken || (usesEnvBlynk ? blynkToken : '');
     if (!token) return;
 
@@ -1067,7 +1236,7 @@ export function createApp({
       if (!/^[a-f0-9-]{36}\.(jpg|png|webp)$/.test(photo)) throw notFound('Photo');
       res.type(photo).send(await downloadPhoto(req, `${req.user.id}/${photo}`));
     });
-    if (localAuth) {
+    if (localAuth && !authClient) {
       app.get('/photos/:photo', requireUser, (req, res) => {
         const photo = req.params.photo;
         if (!plantsFor(req).some((plant) => plant.checkups.some((checkup) => checkup.photo === photo))) {

@@ -1096,7 +1096,7 @@ function renderLiveSetup() {
 
 async function loadSetupPlants() {
   try {
-    const res = await fetch('/api/plants');
+    const res = await fetch('/api/plants', { credentials: 'include' });
     if (!res.ok) return;
     const latest = await res.json();
     const first = !setupPlants.length;

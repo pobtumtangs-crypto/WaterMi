@@ -140,6 +140,68 @@ test('Supabase password and Google sign-in establish secure sessions with user-s
   assert.notEqual(completed.headers.get('set-cookie').split(';')[0], pending.cookie);
 });
 
+test('Supabase mode persists sessions across restarts, supports Bearer JWTs, skips local db.json, and handles OTP/implicit callbacks', async (t) => {
+  const origin = 'https://watermi.example.com';
+  const provider = 'https://project.supabase.co';
+  const user = { id: '22222222-2222-4222-8222-222222222222', email: 'farmer@example.com' };
+  const secret = 'test-render-session-secret-0123456789';
+  let revoked = 0;
+
+  const makeAuthClient = () => createSupabaseFactory(provider, 'public-key', async (input, init) => {
+    const url = new URL(input);
+    const headers = new Headers(init.headers);
+    if (url.pathname === '/rest/v1/plants') {
+      assert.equal(headers.get('authorization'), 'Bearer jwt-access-token');
+      assert.equal(url.searchParams.get('user_id'), `eq.${user.id}`);
+      return Response.json([]);
+    }
+    if (url.pathname === '/auth/v1/user') {
+      assert.equal(headers.get('authorization'), 'Bearer jwt-access-token');
+      return Response.json(user);
+    }
+    if (url.pathname === '/auth/v1/logout') {
+      revoked += 1;
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === '/auth/v1/verify' || url.pathname === '/auth/v1/token') {
+      return Response.json({
+        user,
+        token_type: 'bearer',
+        access_token: 'jwt-access-token',
+        refresh_token: 'jwt-refresh-token',
+        expires_in: 3600,
+      });
+    }
+    throw new Error(`Unexpected Supabase call: ${url.pathname}`);
+  });
+
+  // Instance 1: even with a broken db.json path, Supabase mode never opens local disk storage.
+  const first = await start(t, { authClient: makeAuthClient(), sessionSecret: secret, secureCookies: true, publicOrigin: origin });
+  writeFileSync(join(first.dataDir, 'db.json'), '{broken');
+  const headers = { origin, 'x-forwarded-proto': 'https' };
+  const login = await first.call('POST', '/api/auth/login', { email: user.email, password: 'testing-123' }, headers);
+  assert.equal(login.status, 200);
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+
+  // Instance 2 (simulates Render restart/spin-down with the same SESSION_SECRET): session cookie still works!
+  const second = await start(t, { authClient: makeAuthClient(), sessionSecret: secret, secureCookies: true, publicOrigin: origin });
+  assert.deepEqual((await second.call('GET', '/api/plants', undefined, { ...headers, cookie })).body, []);
+
+  // Bearer Supabase JWT works without a cookie.
+  assert.deepEqual((await second.call('GET', '/api/plants', undefined, { authorization: 'Bearer jwt-access-token' })).body, []);
+
+  // OTP email confirmation & implicit hash callbacks establish a session.
+  const otp = await second.call('POST', '/api/auth/callback', { tokenHash: 'hash-123', type: 'signup' }, headers);
+  assert.equal(otp.status, 200);
+  const implicit = await second.call('POST', '/api/auth/callback', { accessToken: 'jwt-access-token', refreshToken: 'jwt-refresh-token' }, headers);
+  assert.equal(implicit.status, 200);
+
+  // Logout revokes the token in Supabase and blocks cookie replay.
+  assert.equal((await second.call('POST', '/api/auth/logout', undefined, { ...headers, cookie })).status, 200);
+  assert.equal(revoked, 1);
+  assert.equal((await second.call('GET', '/api/plants', undefined, { ...headers, cookie })).status, 401);
+});
+
 test('plant create, update, watering and validation', async (t) => {
   const { call } = await start(t);
   assert.equal((await call('POST', '/api/plants', { name: '  ' })).status, 400);

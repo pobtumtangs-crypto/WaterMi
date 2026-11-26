@@ -13,7 +13,7 @@ The Render Blueprint uses Docker and checks `/healthz`. For an existing Render s
 3. In Supabase Authentication → URL Configuration, set the Site URL to the deployed origin and add that origin with `/auth/callback` to Redirect URLs. For Google sign-in, enable Google's provider in Supabase and authorize the Supabase project's `/auth/v1/callback` URL in Google Cloud.
 4. Deploy the linked GitHub branch. Check `/healthz`, sign in, and confirm the plant list loads.
 
-Web sessions are held in the running instance. A restart or redeploy signs users out. Cloud sensor polling uses the Blynk token linked to each plant. The older device push endpoints require an authenticated session in this account-based configuration.
+Web sessions are stored in AES-256-GCM encrypted HttpOnly cookies signed with `SESSION_SECRET`, so users stay signed in across Render restarts and spin-downs. API routes also accept `Authorization: Bearer <supabase-jwt>`. All plant data, checkups, and photos live in Supabase (no local disk required). Cloud sensor polling uses the Blynk token linked to each plant. The older device push endpoints require an authenticated session or Bearer JWT in this account-based configuration.
 
 ## Option A: Deploy on Railway (Recommended — Easiest)
 

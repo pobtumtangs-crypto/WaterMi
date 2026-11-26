@@ -1,3 +1,6 @@
 node_modules/
 .env
 data/
+cookies*.txt
+server.log
+HANDOFF.md
