@@ -1,10 +1,12 @@
 import express from 'express';
-import { randomUUID } from 'node:crypto';
+import session from 'express-session';
+import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { cleanSuggestions, plantnetSuggestions } from './plantnet.js';
 import { groqAnalysis } from './groq.js';
+import { createSupabaseFactory } from './supabase.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -412,6 +414,11 @@ export function createApp({
   blynkTemplateId = '',
   blynkServer = 'https://blynk.cloud',
   blynkPlantId = '',
+  authClient = null,
+  localAuth = false,
+  sessionSecret,
+  secureCookies = false,
+  publicOrigin,
 } = {}) {
   const store = openStore(dataDir);
   const ai = { fetch, apiKey };
@@ -423,10 +430,236 @@ export function createApp({
   let mockCount = 0;
   const pause = (ms) => new Promise((done) => setTimeout(done, ms));
 
+  const authEnabled = Boolean(authClient || localAuth);
+  const localUsers = new Map();
+  const refreshing = new Map();
+  const cookieName = 'leafwise.sid';
+
+  function passwordHash(password, salt) {
+    return scryptSync(password, salt, 64);
+  }
+
+  const saveSession = (req) => new Promise((resolve, reject) => {
+    req.session.save((err) => err ? reject(err) : resolve());
+  });
+
+  async function startSession(req, user, providerSession) {
+    await new Promise((resolve, reject) => {
+      req.session.regenerate((err) => err ? reject(err) : resolve());
+    });
+    req.session.user = {
+      id: user.id,
+      email: user.email,
+      name: user.user_metadata?.name || user.user_metadata?.full_name || user.name || user.email?.split('@')[0],
+    };
+    req.session.providerSession = providerSession;
+    await saveSession(req);
+  }
+
+  function providerSession(session) {
+    return {
+      access_token: session.access_token,
+      refresh_token: session.refresh_token,
+      expires_at: session.expires_at,
+    };
+  }
+
+  async function loadSession(req, res, next) {
+    const user = req.session.user;
+    if (!user) return next();
+    if (!authClient) {
+      req.user = user;
+      return next();
+    }
+
+    let credentials = req.session.providerSession;
+    if (credentials.expires_at * 1000 <= Date.now() + 30_000) {
+      const refreshToken = credentials.refresh_token;
+      let pending = refreshing.get(refreshToken);
+      if (!pending) {
+        pending = authClient().auth.refreshSession({ refresh_token: refreshToken });
+        refreshing.set(refreshToken, pending);
+      }
+      try {
+        const { data, error } = await pending;
+        if (error?.status >= 500) throw error;
+        if (error || !data.session) {
+          delete req.session.user;
+          delete req.session.providerSession;
+          await saveSession(req);
+          return next();
+        }
+        credentials = providerSession(data.session);
+        req.session.providerSession = credentials;
+        await saveSession(req);
+      } finally {
+        refreshing.delete(refreshToken);
+      }
+    }
+
+    req.user = user;
+    req.db = authClient({ token: credentials.access_token });
+    next();
+  }
+
+  function requireUser(req, res, next) {
+    if (authEnabled && !req.user) {
+      throw new ApiError(401, 'authentication_required', 'Please sign in to continue.');
+    }
+    next();
+  }
+
+  function requireAuthClient(req, res, next) {
+    if (!authClient) throw new ApiError(503, 'auth_unavailable', 'Google sign-in is unavailable in this environment.');
+    next();
+  }
+
+  function callbackUrl(req) {
+    return new URL('/auth/callback', publicOrigin || `${req.protocol}://${req.get('host')}`).href;
+  }
+
+  function oauthStorage(req) {
+    return {
+      getItem: (key) => req.session.oauth?.[key] ?? null,
+      setItem: (key, value) => { (req.session.oauth ??= {})[key] = value; },
+      removeItem: (key) => { delete req.session.oauth?.[key]; },
+    };
+  }
+
+  function onlySameOrigin(req, res, next) {
+    const origin = req.get('origin');
+    if (origin && origin !== new URL(callbackUrl(req)).origin) {
+      throw new ApiError(403, 'invalid_origin', 'Authentication requires a request from this site.');
+    }
+    next();
+  }
+
+  function credentialsFrom(req) {
+    const { email: rawEmail, password } = req.body ?? {};
+    const email = typeof rawEmail === 'string' ? rawEmail.trim().toLowerCase() : '';
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 ||
+        typeof password !== 'string' || !password || Buffer.byteLength(password) > 1024) {
+      throw badRequest('Enter a valid email address and password.');
+    }
+    return { email, password };
+  }
+
+  function createLocalUser(email, password, name) {
+    const salt = randomBytes(16);
+    const user = { id: randomUUID(), email, name, salt, hash: passwordHash(password, salt) };
+    localUsers.set(email, user);
+    return user;
+  }
+
+  app.get('/healthz', (req, res) => res.sendStatus(200));
   app.use(express.json({ limit: '10mb' }));
+
+  if (authEnabled) {
+    if (secureCookies) app.set('trust proxy', 1);
+    app.use(session({
+      name: cookieName,
+      secret: sessionSecret || randomBytes(32).toString('hex'),
+      resave: false,
+      saveUninitialized: false,
+      cookie: { httpOnly: true, secure: secureCookies, sameSite: 'lax', maxAge: 7 * 24 * 60 * 60 * 1000 },
+    }));
+    app.use((req, res, next) => {
+      if (req.path === '/' || req.path === '/index.html' || req.path.startsWith('/api/') || req.path.startsWith('/photos/')) {
+        res.set('Cache-Control', 'no-store');
+        if (!req.path.startsWith('/api/auth/')) return loadSession(req, res, next);
+      }
+      next();
+    });
+
+    app.get(['/', '/index.html'], (req, res) => {
+      res.sendFile(join(ROOT, 'public', req.user ? 'index.html' : 'login.html'));
+    });
+    app.get('/register', (req, res) => res.sendFile(join(ROOT, 'public', 'register.html')));
+    app.get('/auth/callback', (req, res) => res.sendFile(join(ROOT, 'public', 'auth-callback.html'), {
+      headers: { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' },
+    }));
+
+    app.use('/api/auth', onlySameOrigin);
+    app.post('/api/auth/login', async (req, res) => {
+      const { email, password } = credentialsFrom(req);
+      if (localAuth) {
+        const user = localUsers.get(email) ?? createLocalUser(email, password);
+        if (!timingSafeEqual(user.hash, passwordHash(password, user.salt))) {
+          throw new ApiError(401, 'invalid_credentials', 'Invalid email or password.');
+        }
+        await startSession(req, user);
+        return res.json({ userId: user.id, email: user.email });
+      }
+
+      const { data, error } = await authClient().auth.signInWithPassword({ email, password });
+      if (error || !data.session) throw new ApiError(error?.status >= 500 ? 502 : 401,
+        'login_failed', error?.message || 'Sign-in could not be completed.');
+      await startSession(req, data.user, providerSession(data.session));
+      res.json({ userId: data.user.id, email: data.user.email });
+    });
+
+    app.post('/api/auth/register', async (req, res) => {
+      const { email, password } = credentialsFrom(req);
+      if (password.length < 6) throw badRequest('Password must be at least 6 characters.');
+      const name = text(req.body.name, 80);
+      if (localAuth) {
+        if (localUsers.has(email)) throw badRequest('Email already registered.');
+        const user = createLocalUser(email, password, name);
+        await startSession(req, user);
+        return res.status(201).json({ needsConfirmation: false });
+      }
+
+      const { data, error } = await authClient({ storage: oauthStorage(req) }).auth.signUp({
+        email, password, options: { data: { name }, emailRedirectTo: callbackUrl(req) },
+      });
+      if (error) throw badRequest(error.message);
+      if (data.session) await startSession(req, data.user, providerSession(data.session));
+      else await saveSession(req);
+      res.status(201).json({ needsConfirmation: !data.session });
+    });
+
+    app.post('/api/auth/google', requireAuthClient, async (req, res) => {
+      const { data, error } = await authClient({ storage: oauthStorage(req) }).auth.signInWithOAuth({
+        provider: 'google',
+        options: { redirectTo: callbackUrl(req), skipBrowserRedirect: true },
+      });
+      if (error || !data?.url) throw badRequest(error?.message || 'Google sign-in could not be started.');
+      await saveSession(req);
+      res.json({ url: data.url });
+    });
+
+    app.post('/api/auth/callback', requireAuthClient, async (req, res) => {
+      const { code } = req.body ?? {};
+      if (typeof code !== 'string' || !code || !req.session.oauth) {
+        throw badRequest('This sign-in link is invalid or expired. If you confirmed your email in another browser, return to sign in.');
+      }
+      const { data, error } = await authClient({ storage: oauthStorage(req) }).auth.exchangeCodeForSession(code);
+      if (error || !data.session) throw badRequest(error?.message || 'Sign-in could not be completed.');
+      await startSession(req, data.user, providerSession(data.session));
+      res.json({ ok: true });
+    });
+
+    app.post('/api/auth/logout', async (req, res) => {
+      const token = req.session.providerSession?.access_token;
+      if (authClient && token) {
+        try {
+          const { error } = await authClient().auth.admin.signOut(token, 'local');
+          if (error) console.error('Could not revoke session:', error.message);
+        } catch (err) {
+          console.error('Could not revoke session:', err.message);
+        }
+      }
+      await new Promise((resolve, reject) => {
+        req.session.destroy((err) => err ? reject(err) : resolve());
+      });
+      res.clearCookie(cookieName, { httpOnly: true, secure: secureCookies, sameSite: 'lax' });
+      res.json({ ok: true });
+    });
+  }
+
   app.use(express.static(join(ROOT, 'public')));
   app.use('/arduino', express.static(join(ROOT, 'arduino')));
-  app.use('/photos', express.static(store.photoDir));
+  if (!authEnabled) app.use('/photos', express.static(store.photoDir));
 
   app.get('/api/config', (req, res) => {
     res.json({
@@ -434,6 +667,7 @@ export function createApp({
       mock,
       analysisModel,
       chatModel,
+      ...(authEnabled && { authEnabled, user: req.user ?? null }),
       ...(blynkTemplateId && { blynkTemplateId }),
     });
   });
@@ -444,7 +678,7 @@ export function createApp({
     if (sensorTimeoutMs > 0 && Number.isFinite(updatedAt) && Date.now() - updatedAt > sensorTimeoutMs) {
       for (const s of Object.values(sensors)) s.connected = false;
     }
-    const { blynkToken: savedToken, ...safePlant } = plant;
+    const { blynkToken: savedToken, userId, ...safePlant } = plant;
     const usesEnvBlynk = Boolean(blynkToken && (!blynkPlantId ? store.plants()[0]?.id === plant.id : blynkPlantId === plant.id));
     return { ...safePlant, blynkLinked: Boolean(savedToken || usesEnvBlynk), sensors };
   };
@@ -452,7 +686,7 @@ export function createApp({
   const BLYNK_PINS = { v0: 'humidity', v1: 'temperature', v2: 'soilMoisture', v3: 'light' };
   const lastBlynkSyncByPlant = new Map();
 
-  async function syncPlantFromBlynk(plant, { force = false } = {}) {
+  async function syncPlantFromBlynk(plant, { force = false, save = store.save } = {}) {
     const usesEnvBlynk = Boolean(blynkToken && (!blynkPlantId ? store.plants()[0]?.id === plant.id : blynkPlantId === plant.id));
     const token = plant.blynkToken || (usesEnvBlynk ? blynkToken : '');
     if (!token) return;
@@ -483,89 +717,308 @@ export function createApp({
       }
       plant.sensors = normalizeSensors(patch, plant.sensors);
       plant.sensorsUpdatedAt = new Date().toISOString();
-      store.save();
+      await save();
     } catch (err) {
       console.error(`Blynk sync failed for ${plant.id}: ${err.message}`);
     }
   }
 
-  async function syncBlynkIfConfigured() {
-    const targets = store.plants().filter((p) => p.blynkToken || (blynkToken && (!blynkPlantId ? store.plants()[0]?.id === p.id : blynkPlantId === p.id)));
-    if (targets.length) await Promise.all(targets.map((p) => syncPlantFromBlynk(p)));
+  const plantsFor = (req) => localAuth ? store.plants().filter((p) => p.userId === req.user.id) : store.plants();
+  function localPlant(req, id) {
+    if (!localAuth) return store.find(id);
+    const plant = plantsFor(req).find((p) => p.id === id);
+    if (!plant) throw notFound('Plant');
+    return plant;
   }
 
-  app.get('/api/plants', async (req, res) => {
-    await syncBlynkIfConfigured();
-    res.json(store.plants().map(withSensors));
-  });
-
-  app.post('/api/plants', (req, res) => {
-    const body = req.body ?? {};
-    const name = text(body.name, 80);
-    if (!name) throw badRequest('name is required');
-    const now = new Date().toISOString();
-    const plant = {
-      id: randomUUID(),
-      name,
-      species: text(body.species, 120),
-      location: text(body.location, 120),
-      notes: text(body.notes, 2000),
-      waterEveryDays: [undefined, null, ''].includes(body.waterEveryDays) ? 3 : waterDays(body.waterEveryDays),
-      lastWatered: now,
-      createdAt: now,
-      sensors: normalizeSensors(body.sensors),
-      checkups: [],
+  const plantFields = 'id,name,species,location,notes,water_every_days,last_watered,created_at,sensors,sensors_updated_at,blynk_token,blynk_server,checkups(id,date,photo,note,health_score,status,report)';
+  function cloudPlant(row) {
+    const { water_every_days, last_watered, created_at, sensors_updated_at, blynk_token, blynk_server, checkups, ...plant } = row;
+    return {
+      ...plant,
+      waterEveryDays: water_every_days,
+      lastWatered: last_watered,
+      createdAt: created_at,
+      sensorsUpdatedAt: sensors_updated_at,
+      blynkToken: blynk_token,
+      blynkServer: blynk_server,
+      checkups: (checkups ?? []).sort((a, b) => Date.parse(a.date) - Date.parse(b.date)),
     };
-    store.plants().push(plant);
-    store.save();
-    res.status(201).json(plant);
-  });
+  }
 
-  app.patch('/api/plants/:id', async (req, res) => {
-    const plant = store.find(req.params.id);
-    const body = req.body ?? {};
-    const changes = {};
-    for (const [field, max] of [['name', 80], ['species', 120], ['location', 120], ['notes', 2000]]) {
-      if (body[field] !== undefined) changes[field] = text(body[field], max);
-    }
-    if (changes.name === '') throw badRequest('name cannot be empty');
-    if (body.waterEveryDays !== undefined) changes.waterEveryDays = waterDays(body.waterEveryDays);
-    if (body.watered === true) changes.lastWatered = new Date().toISOString();
-    if (body.sensors !== undefined) {
-      if (!body.sensors || typeof body.sensors !== 'object' || Array.isArray(body.sensors)) {
-        throw badRequest('sensors must be an object');
-      }
-      changes.sensors = normalizeSensors(body.sensors, plant.sensors);
-    }
-    let blynkChanged = false;
-    if (body.blynkToken !== undefined) {
-      changes.blynkToken = text(body.blynkToken, 120);
-      blynkChanged = true;
-      if (!changes.blynkToken) {
-        changes.sensors = normalizeSensors({});
-      }
-    }
-    if (body.blynkServer !== undefined) {
-      const serverUrl = text(body.blynkServer, 200);
-      if (serverUrl && !/^https:\/\/[a-z0-9.-]+$/i.test(serverUrl)) {
-        throw badRequest('blynkServer must be an https:// hostname');
-      }
-      changes.blynkServer = serverUrl;
-    }
-    Object.assign(plant, changes);
-    store.save();
-    if (blynkChanged && plant.blynkToken) {
-      await syncPlantFromBlynk(plant, { force: true });
-    }
-    res.json(withSensors(plant));
-  });
+  function checkCloudError(error) {
+    if (error) throw new Error(error.message);
+  }
 
-  app.post('/api/plants/:id/sensors', (req, res) => {
-    if (sensorKey && req.get('x-sensor-key') !== sensorKey) {
-      throw new ApiError(401, 'bad_key', 'Invalid or missing x-sensor-key header');
+  const ownedPlants = (req) => req.db.from('plants');
+  async function findPlant(req, id) {
+    if (!authClient) return localPlant(req, id);
+    const { data, error } = await ownedPlants(req).select(plantFields)
+      .eq('user_id', req.user.id).eq('id', id).maybeSingle();
+    checkCloudError(error);
+    if (!data) throw notFound('Plant');
+    return cloudPlant(data);
+  }
+
+  async function updateCloudPlant(req, id, changes) {
+    const { data, error } = await ownedPlants(req).update(changes)
+      .eq('user_id', req.user.id).eq('id', id).select(plantFields).maybeSingle();
+    checkCloudError(error);
+    if (!data) throw notFound('Plant');
+    return cloudPlant(data);
+  }
+
+  async function syncCloudPlant(req, plant, force = false) {
+    await syncPlantFromBlynk(plant, { force, save: async () => {
+      await updateCloudPlant(req, plant.id, { sensors: plant.sensors, sensors_updated_at: plant.sensorsUpdatedAt });
+    } });
+  }
+
+  if (authClient) {
+    app.get('/api/plants', requireUser, async (req, res) => {
+      const { data, error } = await ownedPlants(req).select(plantFields)
+        .eq('user_id', req.user.id).order('created_at');
+      checkCloudError(error);
+      const plants = data.map(cloudPlant);
+      await Promise.all(plants.filter((plant) => plant.blynkToken).map((plant) => syncCloudPlant(req, plant)));
+      res.json(plants.map(withSensors));
+    });
+
+    app.post('/api/plants', requireUser, async (req, res) => {
+      const body = req.body ?? {};
+      const name = text(body.name, 80);
+      if (!name) throw badRequest('name is required');
+      const { data, error } = await ownedPlants(req).insert({
+        name,
+        species: text(body.species, 120),
+        location: text(body.location, 120),
+        notes: text(body.notes, 2000),
+        water_every_days: [undefined, null, ''].includes(body.waterEveryDays) ? 3 : waterDays(body.waterEveryDays),
+        sensors: normalizeSensors(body.sensors),
+        user_id: req.user.id,
+      }).select(plantFields).single();
+      checkCloudError(error);
+      res.status(201).json(withSensors(cloudPlant(data)));
+    });
+
+    app.patch('/api/plants/:id', requireUser, async (req, res) => {
+      const plant = await findPlant(req, req.params.id);
+      const body = req.body ?? {};
+      const changes = {};
+      for (const [field, max] of [['name', 80], ['species', 120], ['location', 120], ['notes', 2000]]) {
+        if (body[field] !== undefined) changes[field] = text(body[field], max);
+      }
+      if (changes.name === '') throw badRequest('name cannot be empty');
+      if (body.waterEveryDays !== undefined) changes.water_every_days = waterDays(body.waterEveryDays);
+      if (body.watered === true) changes.last_watered = new Date().toISOString();
+      if (body.sensors !== undefined) {
+        if (!body.sensors || typeof body.sensors !== 'object' || Array.isArray(body.sensors)) {
+          throw badRequest('sensors must be an object');
+        }
+        changes.sensors = normalizeSensors(body.sensors, plant.sensors);
+      }
+      if (body.blynkToken !== undefined) {
+        changes.blynk_token = text(body.blynkToken, 120);
+        if (!changes.blynk_token) changes.sensors = normalizeSensors({});
+      }
+      if (body.blynkServer !== undefined) {
+        const url = text(body.blynkServer, 200);
+        if (url && !/^https:\/\/(?:[a-z0-9-]+\.)*blynk\.cloud$/i.test(url)) {
+          throw badRequest('blynkServer must be an HTTPS blynk.cloud hostname');
+        }
+        changes.blynk_server = url;
+      }
+      const updated = Object.keys(changes).length ? await updateCloudPlant(req, plant.id, changes) : plant;
+      if (updated.blynkToken && ('blynk_token' in changes || 'blynk_server' in changes)) {
+        await syncCloudPlant(req, updated, true);
+      }
+      res.json(withSensors(updated));
+    });
+
+    app.post('/api/plants/:id/sensors', requireUser, async (req, res) => {
+      verifySensorKey(req);
+      const plant = await findPlant(req, req.params.id);
+      const updated = await updateCloudPlant(req, plant.id, {
+        sensors: normalizeSensors(sensorPatch(req.body ?? {}), plant.sensors),
+        sensors_updated_at: new Date().toISOString(),
+      });
+      res.json(withSensors(updated));
+    });
+
+    app.delete('/api/plants/:id', requireUser, async (req, res) => {
+      const plant = await findPlant(req, req.params.id);
+      const { error } = await ownedPlants(req).delete().eq('id', plant.id).eq('user_id', req.user.id);
+      checkCloudError(error);
+      await removeCloudPhotos(req, plant.checkups.map((checkup) => checkup.photo));
+      res.json({ ok: true });
+    });
+
+    app.post('/api/plants/:id/checkups', requireUser, async (req, res) => {
+      const plant = await findPlant(req, req.params.id);
+      const image = parseImage(req.body?.image);
+      if (!Number.isFinite(req.body?.report?.health_score)) {
+        throw badRequest('report with a numeric health_score is required');
+      }
+      const report = normalizeReport(req.body.report);
+      const id = randomUUID();
+      const photo = `${req.user.id}/${id}.${image.ext}`;
+      const upload = await req.db.storage.from('plant-photos').upload(photo, image.bytes, { contentType: image.mimeType });
+      checkCloudError(upload.error);
+      const { error } = await req.db.from('checkups').insert({
+        id,
+        plant_id: plant.id,
+        user_id: req.user.id,
+        photo,
+        note: text(req.body.note, 2000),
+        health_score: report.health_score,
+        status: report.status,
+        report,
+      });
+      if (error) {
+        await removeCloudPhotos(req, [photo]);
+        checkCloudError(error);
+      }
+      res.status(201).json(withSensors(await findPlant(req, plant.id)));
+    });
+
+    app.delete('/api/plants/:id/checkups/:cid', requireUser, async (req, res) => {
+      const plant = await findPlant(req, req.params.id);
+      const checkup = plant.checkups.find((item) => item.id === req.params.cid);
+      if (!checkup) throw notFound('Checkup');
+      const { error } = await req.db.from('checkups').delete()
+        .eq('id', checkup.id).eq('plant_id', plant.id).eq('user_id', req.user.id);
+      checkCloudError(error);
+      await removeCloudPhotos(req, [checkup.photo]);
+      res.json(withSensors(await findPlant(req, plant.id)));
+    });
+  } else {
+    async function syncBlynkIfConfigured(plants) {
+      const targets = plants.filter((p) => p.blynkToken || (blynkToken && (!blynkPlantId ? plants[0]?.id === p.id : blynkPlantId === p.id)));
+      if (targets.length) await Promise.all(targets.map((p) => syncPlantFromBlynk(p)));
     }
-    const plant = store.find(req.params.id);
-    const body = req.body ?? {};
+
+    app.get('/api/plants', requireUser, async (req, res) => {
+      const plants = plantsFor(req);
+      await syncBlynkIfConfigured(plants);
+      res.json(plants.map(withSensors));
+    });
+
+    app.post('/api/plants', requireUser, (req, res) => {
+      const body = req.body ?? {};
+      const name = text(body.name, 80);
+      if (!name) throw badRequest('name is required');
+      const now = new Date().toISOString();
+      const plant = {
+        id: randomUUID(),
+        ...(localAuth && { userId: req.user.id }),
+        name,
+        species: text(body.species, 120),
+        location: text(body.location, 120),
+        notes: text(body.notes, 2000),
+        waterEveryDays: [undefined, null, ''].includes(body.waterEveryDays) ? 3 : waterDays(body.waterEveryDays),
+        lastWatered: now,
+        createdAt: now,
+        sensors: normalizeSensors(body.sensors),
+        checkups: [],
+      };
+      store.plants().push(plant);
+      store.save();
+      res.status(201).json(plant);
+    });
+
+    app.patch('/api/plants/:id', requireUser, async (req, res) => {
+      const plant = localPlant(req, req.params.id);
+      const body = req.body ?? {};
+      const changes = {};
+      for (const [field, max] of [['name', 80], ['species', 120], ['location', 120], ['notes', 2000]]) {
+        if (body[field] !== undefined) changes[field] = text(body[field], max);
+      }
+      if (changes.name === '') throw badRequest('name cannot be empty');
+      if (body.waterEveryDays !== undefined) changes.waterEveryDays = waterDays(body.waterEveryDays);
+      if (body.watered === true) changes.lastWatered = new Date().toISOString();
+      if (body.sensors !== undefined) {
+        if (!body.sensors || typeof body.sensors !== 'object' || Array.isArray(body.sensors)) {
+          throw badRequest('sensors must be an object');
+        }
+        changes.sensors = normalizeSensors(body.sensors, plant.sensors);
+      }
+      let blynkChanged = false;
+      if (body.blynkToken !== undefined) {
+        changes.blynkToken = text(body.blynkToken, 120);
+        blynkChanged = true;
+        if (!changes.blynkToken) {
+          changes.sensors = normalizeSensors({});
+        }
+      }
+      if (body.blynkServer !== undefined) {
+        const serverUrl = text(body.blynkServer, 200);
+        if (serverUrl && !/^https:\/\/[a-z0-9.-]+$/i.test(serverUrl)) {
+          throw badRequest('blynkServer must be an https:// hostname');
+        }
+        changes.blynkServer = serverUrl;
+      }
+      Object.assign(plant, changes);
+      store.save();
+      if (blynkChanged && plant.blynkToken) {
+        await syncPlantFromBlynk(plant, { force: true });
+      }
+      res.json(withSensors(plant));
+    });
+
+    app.post('/api/plants/:id/sensors', requireUser, (req, res) => {
+      verifySensorKey(req);
+      const plant = localPlant(req, req.params.id);
+      const patch = sensorPatch(req.body ?? {});
+      plant.sensors = normalizeSensors(patch, plant.sensors);
+      plant.sensorsUpdatedAt = new Date().toISOString();
+      store.save();
+      res.json(withSensors(plant));
+    });
+
+    app.delete('/api/plants/:id', requireUser, (req, res) => {
+      const plant = localPlant(req, req.params.id);
+      store.plants().splice(store.plants().indexOf(plant), 1);
+      store.save();
+      store.removePhotos(plant.checkups);
+      res.json({ ok: true });
+    });
+
+    app.post('/api/plants/:id/checkups', requireUser, (req, res) => {
+      const plant = localPlant(req, req.params.id);
+      const image = parseImage(req.body?.image);
+      if (!Number.isFinite(req.body?.report?.health_score)) {
+        throw badRequest('report with a numeric health_score is required');
+      }
+      const report = normalizeReport(req.body.report);
+      const id = randomUUID();
+      const checkup = {
+        id,
+        date: new Date().toISOString(),
+        photo: `${id}.${image.ext}`,
+        note: text(req.body.note, 2000),
+        health_score: report.health_score,
+        status: report.status,
+        report,
+      };
+      writeFileSync(join(store.photoDir, checkup.photo), image.bytes);
+      plant.checkups.push(checkup);
+      store.save();
+      res.status(201).json(withSensors(plant));
+    });
+
+    app.delete('/api/plants/:id/checkups/:cid', requireUser, (req, res) => {
+      const plant = localPlant(req, req.params.id);
+      const index = plant.checkups.findIndex((c) => c.id === req.params.cid);
+      if (index === -1) throw notFound('Checkup');
+      const removed = plant.checkups.splice(index, 1);
+      store.save();
+      store.removePhotos(removed);
+      res.json(withSensors(plant));
+    });
+
+  }
+
+  function sensorPatch(body = {}) {
     const raw = body.sensors && typeof body.sensors === 'object' && !Array.isArray(body.sensors) ? body.sensors : body;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw badRequest('sensor payload must be an object');
@@ -585,57 +1038,50 @@ export function createApp({
           : { connected: false, value: null };
       }
     }
-    plant.sensors = normalizeSensors(patch, plant.sensors);
-    plant.sensorsUpdatedAt = new Date().toISOString();
-    store.save();
-    res.json(withSensors(plant));
-  });
+    return patch;
+  }
 
-  app.delete('/api/plants/:id', (req, res) => {
-    const plant = store.find(req.params.id);
-    store.plants().splice(store.plants().indexOf(plant), 1);
-    store.save();
-    store.removePhotos(plant.checkups);
-    res.json({ ok: true });
-  });
-
-  app.post('/api/plants/:id/checkups', (req, res) => {
-    const plant = store.find(req.params.id);
-    const image = parseImage(req.body?.image);
-    if (!Number.isFinite(req.body?.report?.health_score)) {
-      throw badRequest('report with a numeric health_score is required');
+  function verifySensorKey(req) {
+    if (sensorKey && req.get('x-sensor-key') !== sensorKey) {
+      throw new ApiError(401, 'bad_key', 'Invalid or missing x-sensor-key header');
     }
-    const report = normalizeReport(req.body.report);
-    const id = randomUUID();
-    const checkup = {
-      id,
-      date: new Date().toISOString(),
-      photo: `${id}.${image.ext}`,
-      note: text(req.body.note, 2000),
-      health_score: report.health_score,
-      status: report.status,
-      report,
-    };
-    writeFileSync(join(store.photoDir, checkup.photo), image.bytes);
-    plant.checkups.push(checkup);
-    store.save();
-    res.status(201).json(withSensors(plant));
-  });
+  }
 
-  app.delete('/api/plants/:id/checkups/:cid', (req, res) => {
-    const plant = store.find(req.params.id);
-    const index = plant.checkups.findIndex((c) => c.id === req.params.cid);
-    if (index === -1) throw notFound('Checkup');
-    const removed = plant.checkups.splice(index, 1);
-    store.save();
-    store.removePhotos(removed);
-    res.json(withSensors(plant));
-  });
+  async function removeCloudPhotos(req, photos) {
+    if (!photos.length) return;
+    const { error } = await req.db.storage.from('plant-photos').remove(photos);
+    if (error) console.error('Could not remove checkup photos:', error.message);
+  }
 
-  app.post('/api/analyze', async (req, res) => {
+  async function downloadPhoto(req, path) {
+    if (!authClient) return readFileSync(join(store.photoDir, path));
+    const { data, error } = await req.db.storage.from('plant-photos').download(path);
+    if (error || !data) throw notFound('Photo');
+    return Buffer.from(await data.arrayBuffer());
+  }
+
+  if (authEnabled) {
+    app.get('/photos/:owner/:photo', requireUser, async (req, res) => {
+      if (!authClient || req.params.owner !== req.user.id) throw notFound('Photo');
+      const photo = req.params.photo;
+      if (!/^[a-f0-9-]{36}\.(jpg|png|webp)$/.test(photo)) throw notFound('Photo');
+      res.type(photo).send(await downloadPhoto(req, `${req.user.id}/${photo}`));
+    });
+    if (localAuth) {
+      app.get('/photos/:photo', requireUser, (req, res) => {
+        const photo = req.params.photo;
+        if (!plantsFor(req).some((plant) => plant.checkups.some((checkup) => checkup.photo === photo))) {
+          throw notFound('Photo');
+        }
+        res.sendFile(photo, { root: store.photoDir });
+      });
+    }
+  }
+
+  app.post('/api/analyze', requireUser, async (req, res) => {
     const image = parseImage(req.body?.image);
     const note = text(req.body?.note, 2000);
-    const plant = req.body?.plantId ? store.find(req.body.plantId) : null;
+    const plant = req.body?.plantId ? await findPlant(req, req.body.plantId) : null;
 
     if (mock) {
       await pause(mockDelayMs * 15);
@@ -712,9 +1158,9 @@ export function createApp({
     res.json(normalizeReport({ ...report, backup_model: backupModel, plantnet: shown }));
   });
 
-  app.post('/api/chat', async (req, res) => {
+  app.post('/api/chat', requireUser, async (req, res) => {
     const contents = parseHistory(req.body?.history);
-    const plant = req.body?.plantId ? store.find(req.body.plantId) : null;
+    const plant = req.body?.plantId ? await findPlant(req, req.body.plantId) : null;
     const abort = new AbortController();
     res.on('close', () => abort.abort());
 
@@ -746,7 +1192,7 @@ export function createApp({
         try {
           const ext = last.photo.split('.').pop();
           const mimeType = Object.keys(IMAGE_TYPES).find((t) => IMAGE_TYPES[t].ext === ext);
-          const data = readFileSync(join(store.photoDir, last.photo)).toString('base64');
+          const data = (await downloadPhoto(req, last.photo)).toString('base64');
           contents[0].parts.unshift(
             { text: 'Latest checkup photo of this plant:' },
             { inlineData: { mimeType, data } },
@@ -802,7 +1248,7 @@ export function createApp({
   });
 
   // ---------- Blynk webhook ----------
-  app.post('/api/webhook/blynk', (req, res) => {
+  app.post('/api/webhook/blynk', requireUser, async (req, res) => {
     if (sensorKey && req.get('x-sensor-key') !== sensorKey && req.query?.key !== sensorKey) {
       throw new ApiError(401, 'bad_key', 'Invalid or missing x-sensor-key header');
     }
@@ -834,7 +1280,16 @@ export function createApp({
     }
 
     const requestedId = text(req.query?.plantId || body.plantId || blynkPlantId, 80);
-    const allPlants = store.plants();
+    if (authClient) {
+      if (!requestedId) throw badRequest('plantId is required');
+      const plant = await findPlant(req, requestedId);
+      const updated = await updateCloudPlant(req, plant.id, {
+        sensors: normalizeSensors(patch, plant.sensors),
+        sensors_updated_at: new Date().toISOString(),
+      });
+      return res.json(withSensors(updated));
+    }
+    const allPlants = plantsFor(req);
     const plant = (requestedId ? allPlants.find((p) => p.id === requestedId) : null) ?? allPlants[0];
     if (!plant) throw notFound('Plant');
 
@@ -869,7 +1324,17 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const port = Number(env.PORT) || 3000;
   const host = env.HOST || '127.0.0.1';
   const mock = env.MOCK_AI === '1';
+  const production = env.NODE_ENV === 'production';
+  const authClient = createSupabaseFactory(env.SUPABASE_URL, env.SUPABASE_ANON_KEY);
+  if (production && (!authClient || !env.SESSION_SECRET || mock)) {
+    throw new Error('Production requires SUPABASE_URL, SUPABASE_ANON_KEY, and SESSION_SECRET, with MOCK_AI disabled.');
+  }
   const app = createApp({
+    authClient: mock ? null : authClient,
+    localAuth: mock,
+    sessionSecret: env.SESSION_SECRET,
+    secureCookies: production,
+    publicOrigin: env.PUBLIC_ORIGIN || env.RENDER_EXTERNAL_URL,
     dataDir: env.DATA_DIR || undefined,
     apiKey: env.GEMINI_API_KEY || '',
     mock,

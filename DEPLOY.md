@@ -4,6 +4,17 @@ WaterMI is packaged with a `Dockerfile`, `railway.toml`, and `fly.toml` so it de
 
 ---
 
+## Render
+
+The Render Blueprint uses Docker and checks `/healthz`. For an existing Render service, set the health check path and environment variables in its dashboard before deploying the new commit.
+
+1. Run `supabase-schema.sql` in the project's Supabase SQL Editor. Account-owned plants, checkups, and photos use Supabase. Existing local `data/db.json` records need an explicit account migration.
+2. In Render, set `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and a random `SESSION_SECRET`. The Blueprint generates the session secret for new services. Keep existing AI keys in Render and leave `MOCK_AI` disabled.
+3. In Supabase Authentication → URL Configuration, set the Site URL to the deployed origin and add that origin with `/auth/callback` to Redirect URLs. For Google sign-in, enable Google's provider in Supabase and authorize the Supabase project's `/auth/v1/callback` URL in Google Cloud.
+4. Deploy the linked GitHub branch. Check `/healthz`, sign in, and confirm the plant list loads.
+
+Web sessions are held in the running instance. A restart or redeploy signs users out. Cloud sensor polling uses the Blynk token linked to each plant. The older device push endpoints require an authenticated session in this account-based configuration.
+
 ## Option A: Deploy on Railway (Recommended — Easiest)
 
 1. **Push `leafwise/` to a GitHub repository** (note: `.gitignore` already keeps `.env`, `data/`, and `node_modules/` private and out of Git):

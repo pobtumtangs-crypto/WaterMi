@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY server.js plantnet.js groq.js ./
+COPY server.js plantnet.js groq.js supabase.js ./
 COPY public ./public
 COPY arduino ./arduino
 

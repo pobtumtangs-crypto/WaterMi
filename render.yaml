@@ -3,12 +3,18 @@ services:
     name: watermi
     runtime: docker
     plan: free
-    healthCheckPath: /api/config
+    healthCheckPath: /healthz
     envVars:
       - key: HOST
         value: 0.0.0.0
       - key: DATA_DIR
         value: /data
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
       - key: GEMINI_API_KEY
         sync: false
       - key: GROQ_API_KEY

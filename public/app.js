@@ -1,5 +1,16 @@
 const $ = (selector) => document.querySelector(selector);
 
+let currentUser = null;
+
+async function handleLogout() {
+  try {
+    await api('POST', '/api/auth/logout');
+    window.location.replace('/');
+  } catch (err) {
+    toast('Logout failed: ' + friendly(err));
+  }
+}
+
 const STATUS = {
   healthy: { label: 'Healthy', icon: ['M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z', 'M8 12l3 3 5-6'] },
   needs_attention: { label: 'Needs attention', icon: ['M12 3L2 21h20L12 3z', 'M12 10v5M12 18v.5'] },
@@ -67,12 +78,14 @@ async function request(method, url, body) {
       method,
       headers: body ? { 'content-type': 'application/json' } : undefined,
       body: body ? JSON.stringify(body) : undefined,
+      credentials: 'include', // Include session cookies
     });
   } catch {
     throw apiError('Cannot reach the WaterMI server. Check that it is running.', 'offline');
   }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
+    if (data.code === 'authentication_required') window.location.replace('/');
     throw apiError(data.error || `Request failed (${res.status}).`, data.code);
   }
   return res;
@@ -671,7 +684,9 @@ async function saveCheckup(footer, result) {
 
 let streaming = false;
 const chatMemory = new Map(); // used if the browser blocks or fills localStorage
-const chatKey = (id) => `leafwise.chat.${id || 'general'}`;
+const chatKey = (id) => currentUser
+  ? `leafwise.chat.${currentUser.id}.${id || 'general'}`
+  : `leafwise.chat.${id || 'general'}`;
 const currentChat = () => $('#chat-plant').value;
 
 function loadChat(id) {
@@ -894,7 +909,16 @@ $('#dlg-plant').addEventListener('close', stopSensorPolling);
 async function init() {
   showView(location.hash.slice(1));
   try {
-    const [config] = await Promise.all([api('GET', '/api/config'), loadPlants()]);
+    const config = await api('GET', '/api/config');
+    if (config.authEnabled && !config.user) {
+      window.location.replace('/');
+      return;
+    }
+    currentUser = config.user;
+    const logout = $('#logout-btn');
+    logout.hidden = !currentUser;
+    logout.addEventListener('click', handleLogout);
+    await loadPlants();
     $('#demo-tag').hidden = !config.mock;
     if (config.blynkTemplateId && $('#s-blynk-template')) {
       $('#s-blynk-template').value = config.blynkTemplateId;

@@ -10,7 +10,8 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header class="topbar">
+  <!-- Login view (shown when not authenticated) -->
+  <header class="topbar" id="app-header">
     <div class="brand">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19C4 10 10 4 20 4c0 10-6 16-15 15z"/><path d="M5 19l9-9"/></svg>
       <span>WaterMI</span>
@@ -22,11 +23,12 @@
       <button type="button" data-view="chat">Chat</button>
       <button type="button" data-view="setup">Sensors</button>
     </nav>
+    <button type="button" id="logout-btn" hidden class="btn quiet" style="margin-left: auto;">Logout</button>
   </header>
 
   <div id="banner" role="alert" hidden></div>
 
-  <main>
+  <main id="app-main">
     <section id="view-dashboard" class="view active" aria-labelledby="h-dashboard">
       <div class="view-head">
         <h1 id="h-dashboard">Your plants</h1>

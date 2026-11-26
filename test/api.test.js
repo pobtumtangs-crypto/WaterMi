@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
 import { createApp, SENSOR_UNITS, normalizeSensors, plantFacts } from '../server.js';
+import { createSupabaseFactory } from '../supabase.js';
 
 const IMAGE = `data:image/jpeg;base64,${Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0]).toString('base64')}`;
 const history = [{ role: 'user', text: 'Why are my leaves yellow?' }];
@@ -29,7 +30,7 @@ async function start(t, options = {}) {
     });
     const raw = await res.text();
     const isJson = res.headers.get('content-type')?.includes('json');
-    return { status: res.status, body: isJson ? JSON.parse(raw) : raw };
+    return { status: res.status, headers: res.headers, body: isJson ? JSON.parse(raw) : raw };
   };
   return { call, base, dataDir, photos: () => readdirSync(join(dataDir, 'photos')) };
 }
@@ -55,6 +56,88 @@ test('config reports key and mode without exposing the key', async (t) => {
     hasKey: true, mock: false,
     analysisModel: 'gemini-3.8-flash', chatModel: 'gemini-3.5-flash-lite',
   });
+});
+
+test('login protects the dashboard and isolates plant data between sessions', async (t) => {
+  const { call } = await start(t, { mock: true, localAuth: true });
+  assert.match((await call('GET', '/')).body, /Sign in with Email/);
+  assert.match((await call('GET', '/index.html')).body, /Sign in with Email/);
+  assert.equal((await call('GET', '/api/plants')).status, 401);
+
+  const credentials = { email: 'grower@example.com', password: 'testing-123' };
+  const login = await call('POST', '/api/auth/login', credentials);
+  assert.equal(login.status, 200);
+  const signedIn = { cookie: login.headers.get('set-cookie').split(';')[0] };
+  assert.match(login.headers.get('set-cookie'), /HttpOnly; SameSite=Lax/);
+  assert.match((await call('GET', '/', undefined, signedIn)).body, /<title>WaterMI<\/title>/);
+  assert.equal((await call('POST', '/api/plants', { name: 'Basil' }, signedIn)).status, 201);
+  assert.equal((await call('GET', '/api/plants', undefined, signedIn)).body.length, 1);
+
+  const second = await call('POST', '/api/auth/register', { ...credentials, email: 'other@example.com' });
+  assert.equal(second.status, 201);
+  assert.equal(second.body.needsConfirmation, false);
+  const otherUser = { cookie: second.headers.get('set-cookie').split(';')[0] };
+  assert.deepEqual((await call('GET', '/api/plants', undefined, otherUser)).body, []);
+
+  assert.equal((await call('POST', '/api/auth/logout', undefined, signedIn)).status, 200);
+  assert.equal((await call('GET', '/api/plants', undefined, signedIn)).status, 401);
+  assert.equal((await call('POST', '/api/auth/login', { ...credentials, password: 'wrong-password' })).status, 401);
+});
+
+test('Supabase password and Google sign-in establish secure sessions with user-scoped queries', async (t) => {
+  const origin = 'https://watermi.example.com';
+  const provider = 'https://project.supabase.co';
+  const user = { id: '11111111-1111-4111-8111-111111111111', email: 'grower@example.com' };
+  let verifier;
+  const authClient = createSupabaseFactory(provider, 'public-key', async (input, init) => {
+    const url = new URL(input);
+    const headers = new Headers(init.headers);
+    if (url.pathname === '/rest/v1/plants') {
+      assert.equal(headers.get('authorization'), 'Bearer example-access-token');
+      assert.equal(url.searchParams.get('user_id'), `eq.${user.id}`);
+      return Response.json([]);
+    }
+    assert.equal(url.pathname, '/auth/v1/token');
+    const body = JSON.parse(init.body);
+    if (url.searchParams.get('grant_type') === 'password') {
+      assert.equal(body.password, 'testing-123');
+    } else {
+      assert.equal(url.searchParams.get('grant_type'), 'pkce');
+      assert.equal(body.auth_code, 'example-oauth-code');
+      verifier = body.code_verifier;
+    }
+    return Response.json({
+      user,
+      token_type: 'bearer',
+      access_token: 'example-access-token',
+      refresh_token: 'example-refresh-token',
+      expires_in: 3600,
+    });
+  });
+  const { call } = await start(t, { authClient, secureCookies: true, publicOrigin: origin });
+  const headers = { origin, 'x-forwarded-proto': 'https' };
+  const login = await call('POST', '/api/auth/login', { email: user.email, password: 'testing-123' }, headers);
+  assert.equal(login.status, 200);
+  assert.match(login.headers.get('set-cookie'), /HttpOnly; Secure; SameSite=Lax/);
+  const signedIn = { ...headers, cookie: login.headers.get('set-cookie').split(';')[0] };
+  assert.deepEqual((await call('GET', '/api/plants', undefined, signedIn)).body, []);
+
+  const callback = await call('GET', '/auth/callback', undefined, headers);
+  assert.match(callback.body, /src="\/auth-callback.js"/);
+  const oauth = await call('POST', '/api/auth/google', undefined, headers);
+  assert.equal(oauth.status, 200);
+  const redirect = new URL(oauth.body.url);
+  assert.equal(redirect.origin, provider);
+  assert.equal(redirect.searchParams.get('redirect_to'), origin + '/auth/callback');
+  assert.equal(redirect.searchParams.get('code_challenge_method'), 's256');
+
+  const code = { code: 'example-oauth-code' };
+  assert.equal((await call('POST', '/api/auth/callback', code, headers)).status, 400);
+  const pending = { ...headers, cookie: oauth.headers.get('set-cookie').split(';')[0] };
+  const completed = await call('POST', '/api/auth/callback', code, pending);
+  assert.equal(completed.status, 200);
+  assert.ok(verifier);
+  assert.notEqual(completed.headers.get('set-cookie').split(';')[0], pending.cookie);
 });
 
 test('plant create, update, watering and validation', async (t) => {
