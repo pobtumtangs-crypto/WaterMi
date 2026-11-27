@@ -653,7 +653,7 @@ export function createApp({
   }
 
   function requireAuthClient(req, res, next) {
-    if (!authClient) throw new ApiError(503, 'auth_unavailable', 'Google sign-in is unavailable in this environment.');
+    if (!authClient) throw new ApiError(503, 'auth_unavailable', 'Email confirmation is unavailable in this environment.');
     next();
   }
 
@@ -661,7 +661,7 @@ export function createApp({
     return new URL('/auth/callback', publicOrigin || `${req.protocol}://${req.get('host')}`).href;
   }
 
-  function oauthStorage(req) {
+  function emailConfirmationStorage(req) {
     return {
       getItem: (key) => req.session.oauth?.[key] ?? null,
       setItem: (key, value) => { (req.session.oauth ??= {})[key] = value; },
@@ -756,7 +756,7 @@ export function createApp({
         return res.status(201).json({ needsConfirmation: false });
       }
 
-      const { data, error } = await authClient({ storage: oauthStorage(req) }).auth.signUp({
+      const { data, error } = await authClient({ storage: emailConfirmationStorage(req) }).auth.signUp({
         email, password, options: { data: { name }, emailRedirectTo: callbackUrl(req) },
       });
       if (error) throw badRequest(error.message);
@@ -765,23 +765,13 @@ export function createApp({
       res.status(201).json({ needsConfirmation: !data.session });
     });
 
-    app.post('/api/auth/google', requireAuthClient, async (req, res) => {
-      const { data, error } = await authClient({ storage: oauthStorage(req) }).auth.signInWithOAuth({
-        provider: 'google',
-        options: { redirectTo: callbackUrl(req), skipBrowserRedirect: true },
-      });
-      if (error || !data?.url) throw badRequest(error?.message || 'Google sign-in could not be started.');
-      await saveSession(req);
-      res.json({ url: data.url });
-    });
-
     app.post('/api/auth/callback', requireAuthClient, async (req, res) => {
       const { code, tokenHash, type, accessToken, refreshToken } = req.body ?? {};
       if (typeof code === 'string' && code) {
         if (!req.session.oauth) {
           throw badRequest('This sign-in link is invalid or expired. If you confirmed your email in another browser, return to sign in.');
         }
-        const { data, error } = await authClient({ storage: oauthStorage(req) }).auth.exchangeCodeForSession(code);
+        const { data, error } = await authClient({ storage: emailConfirmationStorage(req) }).auth.exchangeCodeForSession(code);
         if (error || !data.session) throw badRequest(error?.message || 'Sign-in could not be completed.');
         await startSession(req, data.user, providerSession(data.session));
         return res.json({ ok: true });

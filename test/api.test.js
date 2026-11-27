@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -84,11 +85,11 @@ test('login protects the dashboard and isolates plant data between sessions', as
   assert.equal((await call('POST', '/api/auth/login', { ...credentials, password: 'wrong-password' })).status, 401);
 });
 
-test('Supabase password and Google sign-in establish secure sessions with user-scoped queries', async (t) => {
+test('Supabase email login and sign-up establish secure sessions with user-scoped queries', async (t) => {
   const origin = 'https://watermi.example.com';
   const provider = 'https://project.supabase.co';
   const user = { id: '11111111-1111-4111-8111-111111111111', email: 'grower@example.com' };
-  let verifier;
+  let challenge;
   const authClient = createSupabaseFactory(provider, 'public-key', async (input, init) => {
     const url = new URL(input);
     const headers = new Headers(init.headers);
@@ -97,14 +98,24 @@ test('Supabase password and Google sign-in establish secure sessions with user-s
       assert.equal(url.searchParams.get('user_id'), `eq.${user.id}`);
       return Response.json([]);
     }
-    assert.equal(url.pathname, '/auth/v1/token');
     const body = JSON.parse(init.body);
+    if (url.pathname === '/auth/v1/signup') {
+      const redirect = new URL(url.searchParams.get('redirect_to'));
+      assert.equal(redirect.origin + redirect.pathname, origin + '/auth/callback');
+      assert.equal(body.email, user.email);
+      assert.equal(body.password, 'testing-123');
+      assert.equal(body.code_challenge_method, 's256');
+      challenge = body.code_challenge;
+      assert.ok(challenge);
+      return Response.json(user);
+    }
+    assert.equal(url.pathname, '/auth/v1/token');
     if (url.searchParams.get('grant_type') === 'password') {
       assert.equal(body.password, 'testing-123');
     } else {
       assert.equal(url.searchParams.get('grant_type'), 'pkce');
-      assert.equal(body.auth_code, 'example-oauth-code');
-      verifier = body.code_verifier;
+      assert.equal(body.auth_code, 'example-confirmation-code');
+      assert.equal(createHash('sha256').update(body.code_verifier).digest('base64url'), challenge);
     }
     return Response.json({
       user,
@@ -116,7 +127,16 @@ test('Supabase password and Google sign-in establish secure sessions with user-s
   });
   const { call } = await start(t, { authClient, secureCookies: true, publicOrigin: origin });
   const headers = { origin, 'x-forwarded-proto': 'https' };
-  const login = await call('POST', '/api/auth/login', { email: user.email, password: 'testing-123' }, headers);
+  const loginPage = await call('GET', '/', undefined, headers);
+  const registerPage = await call('GET', '/register', undefined, headers);
+  assert.match(loginPage.body, /id="login-form"/);
+  assert.match(registerPage.body, /id="register-form"/);
+  assert.doesNotMatch(loginPage.body, /Continue with Google/);
+  assert.doesNotMatch(registerPage.body, /Sign up with Google/);
+  assert.equal((await call('POST', '/api/auth/google', undefined, headers)).status, 404);
+
+  const credentials = { email: user.email, password: 'testing-123' };
+  const login = await call('POST', '/api/auth/login', credentials, headers);
   assert.equal(login.status, 200);
   assert.match(login.headers.get('set-cookie'), /HttpOnly; Secure; SameSite=Lax/);
   const signedIn = { ...headers, cookie: login.headers.get('set-cookie').split(';')[0] };
@@ -124,20 +144,18 @@ test('Supabase password and Google sign-in establish secure sessions with user-s
 
   const callback = await call('GET', '/auth/callback', undefined, headers);
   assert.match(callback.body, /src="\/auth-callback.js"/);
-  const oauth = await call('POST', '/api/auth/google', undefined, headers);
-  assert.equal(oauth.status, 200);
-  const redirect = new URL(oauth.body.url);
-  assert.equal(redirect.origin, provider);
-  assert.equal(redirect.searchParams.get('redirect_to'), origin + '/auth/callback');
-  assert.equal(redirect.searchParams.get('code_challenge_method'), 's256');
+  const registration = await call('POST', '/api/auth/register', credentials, headers);
+  assert.equal(registration.status, 201);
+  assert.deepEqual(registration.body, { needsConfirmation: true });
 
-  const code = { code: 'example-oauth-code' };
+  const code = { code: 'example-confirmation-code' };
   assert.equal((await call('POST', '/api/auth/callback', code, headers)).status, 400);
-  const pending = { ...headers, cookie: oauth.headers.get('set-cookie').split(';')[0] };
+  const pending = { ...headers, cookie: registration.headers.get('set-cookie').split(';')[0] };
   const completed = await call('POST', '/api/auth/callback', code, pending);
   assert.equal(completed.status, 200);
-  assert.ok(verifier);
-  assert.notEqual(completed.headers.get('set-cookie').split(';')[0], pending.cookie);
+  const confirmed = { ...headers, cookie: completed.headers.get('set-cookie').split(';')[0] };
+  assert.notEqual(confirmed.cookie, pending.cookie);
+  assert.deepEqual((await call('GET', '/api/plants', undefined, confirmed)).body, []);
 });
 
 test('Supabase mode persists sessions across restarts, supports Bearer JWTs, skips local db.json, and handles OTP/implicit callbacks', async (t) => {
