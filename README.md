@@ -37,3 +37,4 @@ A mobile-friendly web app with three screens:
 - `confidence` and each problem's `severity` are `low`, `medium` or `high`.
 - Other error codes besides `no_key`, `bad_key`, `quota` and `bad_model`: `bad_request`, `not_found`, `too_large`, `busy`, `ai_error`, `server_error`.
 - If chat fails before the reply starts, the response is a normal JSON `{error, code}`. After it starts, the error arrives as `data: {"error": "...", "code": "..."}`.
+# Trigger deploy
