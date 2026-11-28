@@ -12,7 +12,7 @@ const IMAGE = `data:image/jpeg;base64,${Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 
 const history = [{ role: 'user', text: 'Why are my leaves yellow?' }];
 
 async function start(t, options = {}) {
-  const dataDir = mkdtempSync(join(tmpdir(), 'leafwise-'));
+  const dataDir = mkdtempSync(join(tmpdir(), 'watermi-'));
   const app = createApp({ dataDir, mockDelayMs: 1, ...options });
   const server = await new Promise((done) => {
     const s = app.listen(0, '127.0.0.1', () => done(s));
@@ -882,7 +882,7 @@ test('PATCH /api/plants/:id supports partial sensor updates, status toggles, and
 });
 
 test('legacy db.json plants lacking sensors are normalized on read and unrelated patches without mutating db.json on read', async (t) => {
-  const dataDir = mkdtempSync(join(tmpdir(), 'leafwise-legacy-'));
+  const dataDir = mkdtempSync(join(tmpdir(), 'watermi-legacy-'));
   const legacyDb = {
     plants: [{
       id: 'legacy-1',
@@ -1017,7 +1017,7 @@ test('plantFacts includes connected non-null sensors with lux spacing and omits 
   assert.equal('sensors' in c2Facts, false);
 });
 
-test('served UI files use WaterMI branding with zero user-facing Leafwise occurrences', async (t) => {
+test('served UI files use WaterMI branding with zero legacy branding occurrences', async (t) => {
   const { call } = await start(t);
 
   const html = await call('GET', '/');
@@ -1029,7 +1029,8 @@ test('served UI files use WaterMI branding with zero user-facing Leafwise occurr
   const appJs = await call('GET', '/app.js');
   assert.equal(appJs.status, 200);
   assert.match(appJs.body, /Cannot reach the WaterMI server\. Check that it is running\./);
-  assert.doesNotMatch(appJs.body.replaceAll('leafwise.chat.', ''), /leafwise/i);
+  assert.match(appJs.body, /watermi\.chat\./);
+  assert.doesNotMatch(appJs.body, /leafwise/i);
 
   const css = await call('GET', '/style.css');
   assert.equal(css.status, 200);

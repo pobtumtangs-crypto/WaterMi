@@ -221,7 +221,7 @@ Writing style, the same for every report:
 - "prevention": 2 or 3 items of 1 short sentence each.
 - "watering_advice" and "progress_note": at most 2 short sentences each.`;
 
-const CHAT_PROMPT = `You are Leafwise, a friendly plant and crop advisor for farmers and growers.
+const CHAT_PROMPT = `You are WaterMI, a friendly plant and crop advisor for farmers and growers.
 - Reply in the language of the user's latest message.
 - Keep replies short and practical: usually under 120 words, in short sentences and everyday words.
 - Use only plain paragraphs, "-" bullet lists and **bold**. No headings with "#", tables, numbered lists or emoji.
@@ -434,7 +434,7 @@ export function createApp({
   const localUsers = new Map();
   const refreshing = new Map();
   const revokedTokens = new Map();
-  const cookieName = 'leafwise.sid';
+  const cookieName = 'watermi.sid';
   const cookieMaxAgeMs = 7 * 24 * 60 * 60 * 1000;
   const cookieKey = createHash('sha256').update(sessionSecret || randomBytes(32)).digest();
 
@@ -1517,7 +1517,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       console.error(`Could not start: ${err.message}`);
       process.exit(1);
     }
-    console.log(`Leafwise running at http://localhost:${port}${mock ? ' (demo mode)' : ''}`);
+    console.log(`WaterMI running at http://localhost:${port}${mock ? ' (demo mode)' : ''}`);
     if (!mock) console.log(`Pl@ntNet suggestions: ${env.PLANTNET_API_KEY ? 'on' : 'off'}`);
     if (!mock) console.log(`Groq backup: ${env.GROQ_API_KEY ? 'on' : 'off'}`);
     if (!mock && !env.GEMINI_API_KEY) console.log('No GEMINI_API_KEY set: analysis and chat will not work yet.');

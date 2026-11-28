@@ -17,9 +17,9 @@ Web sessions are stored in AES-256-GCM encrypted HttpOnly cookies signed with `S
 
 ## Option A: Deploy on Railway (Recommended — Easiest)
 
-1. **Push `leafwise/` to a GitHub repository** (note: `.gitignore` already keeps `.env`, `data/`, and `node_modules/` private and out of Git):
+1. **Push `watermi/` to a GitHub repository** (note: `.gitignore` already keeps `.env`, `data/`, and `node_modules/` private and out of Git):
    ```bash
-   cd /home/pobtum/Downloads/leafwise-project/leafwise
+   cd /home/pobtum/Downloads/watermi-project/watermi
    git init
    git add .
    git commit -m "Initial WaterMI deploy"
@@ -52,9 +52,9 @@ Web sessions are stored in AES-256-GCM encrypted HttpOnly cookies signed with `S
    curl -L https://fly.io/install.sh | sh
    fly auth login
    ```
-2. Launch the app from `leafwise/` (change `app = "watermi-app"` in `fly.toml` to a unique name):
+2. Launch the app from `watermi/` (change `app = "watermi-app"` in `fly.toml` to a unique name):
    ```bash
-   cd /home/pobtum/Downloads/leafwise-project/leafwise
+   cd /home/pobtum/Downloads/watermi-project/watermi
    fly launch --no-deploy --copy-config
    ```
 3. Create the persistent volume for saved plants and photos:

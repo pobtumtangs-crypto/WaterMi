@@ -1,4 +1,4 @@
--- Supabase Database Schema for Leafwise
+-- Supabase Database Schema for WaterMI
 -- Run this in the Supabase SQL Editor
 
 -- Enable UUID extension

@@ -685,8 +685,8 @@ async function saveCheckup(footer, result) {
 let streaming = false;
 const chatMemory = new Map(); // used if the browser blocks or fills localStorage
 const chatKey = (id) => currentUser
-  ? `leafwise.chat.${currentUser.id}.${id || 'general'}`
-  : `leafwise.chat.${id || 'general'}`;
+  ? `watermi.chat.${currentUser.id}.${id || 'general'}`
+  : `watermi.chat.${id || 'general'}`;
 const currentChat = () => $('#chat-plant').value;
 
 function loadChat(id) {

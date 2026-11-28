@@ -1,4 +1,4 @@
-# Leafwise
+# WaterMI
 
 Plant and crop health checks with AI, for farmers and growers.
 
