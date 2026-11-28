@@ -2,7 +2,21 @@
   "name": "watermi",
   "version": "1.0.0",
   "private": true,
-  "description": "Plant and crop health checks with AI, for farmers and growers",
+  "description": "AI-powered plant and crop health monitoring with live ESP32 environmental sensors",
+  "homepage": "https://watermi.onrender.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pobtumtangs-crypto/WaterMi.git"
+  },
+  "keywords": [
+    "agritech",
+    "plant-health",
+    "esp32",
+    "iot",
+    "blynk",
+    "gemini-ai",
+    "supabase"
+  ],
   "type": "module",
   "main": "server.js",
   "engines": {
