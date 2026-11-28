@@ -1,10 +1,41 @@
 const $ = (selector) => document.querySelector(selector);
 
 let currentUser = null;
+let appInitialized = false;
+
+function clearStoredChats() {
+  chatMemory.clear();
+  try {
+    if (typeof localStorage === 'undefined' || !localStorage) return;
+    if (typeof localStorage.length === 'number' && typeof localStorage.key === 'function') {
+      const toRemove = [];
+      for (let i = 0; i < localStorage.length; i += 1) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('watermi.chat.')) toRemove.push(k);
+      }
+      for (const k of toRemove) localStorage.removeItem(k);
+    } else if (typeof Object.keys === 'function') {
+      for (const k of Object.keys(localStorage)) {
+        if (k.startsWith('watermi.chat.')) localStorage.removeItem(k);
+      }
+    }
+  } catch {
+    // Ignore storage access failures.
+  }
+}
+
+function clearSetupSecrets() {
+  const authInput = $('#s-blynk-auth');
+  const passInput = $('#s-pass');
+  if (authInput) authInput.value = '';
+  if (passInput) passInput.value = '';
+}
 
 async function handleLogout() {
   try {
     await api('POST', '/api/auth/logout');
+    clearStoredChats();
+    clearSetupSecrets();
     window.location.replace('/');
   } catch (err) {
     toast('Logout failed: ' + friendly(err));
@@ -32,7 +63,7 @@ let plants = [];
 let setupPlants = [];
 let setupSketch = '';
 let setupPollTimer = null;
-let setupViewActive = false;
+let setupPollInFlight = false;
 
 // ---------- DOM helpers (text is always added as text nodes, never as HTML) ----------
 
@@ -51,10 +82,16 @@ const svg = (tag, props, ...children) =>
 const icon = (paths) =>
   svg('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' }, paths.map((d) => svg('path', { d })));
 
-const statusOf = (status) => STATUS[status] ?? STATUS.needs_attention;
-const badge = (status, score) =>
-  el('span', { class: `badge ${status}` }, icon(statusOf(status).icon),
-    score === undefined ? statusOf(status).label : `${score} · ${statusOf(status).label}`);
+const statusKey = (status) => (Object.hasOwn(STATUS, status) ? status : 'needs_attention');
+const statusOf = (status) => STATUS[statusKey(status)];
+const badge = (status, score) => {
+  const safe = statusKey(status);
+  return el('span', { class: `badge ${safe}` }, icon(STATUS[safe].icon),
+    score === undefined ? STATUS[safe].label : `${score} · ${STATUS[safe].label}`);
+};
+
+const photoUrl = (photoPath) =>
+  `/photos/${String(photoPath || '').split('/').map((seg) => encodeURIComponent(seg)).join('/')}`;
 
 let toastTimer;
 function toast(message) {
@@ -74,9 +111,11 @@ const apiError = (message, code) => Object.assign(new Error(message), { code });
 async function request(method, url, body) {
   let res;
   try {
+    const headers = { 'x-requested-with': 'fetch' };
+    if (body) headers['content-type'] = 'application/json';
     res = await fetch(url, {
       method,
-      headers: body ? { 'content-type': 'application/json' } : undefined,
+      headers,
       body: body ? JSON.stringify(body) : undefined,
       credentials: 'include', // Include session cookies
     });
@@ -85,7 +124,11 @@ async function request(method, url, body) {
   }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    if (data.code === 'authentication_required') window.location.replace('/');
+    if (data.code === 'authentication_required') {
+      clearStoredChats();
+      clearSetupSecrets();
+      window.location.replace('/');
+    }
     throw apiError(data.error || `Request failed (${res.status}).`, data.code);
   }
   return res;
@@ -156,11 +199,12 @@ function showView(name) {
   window.scrollTo(0, 0);
   if (view === 'chat') scrollChat();
 
-  // Handle setup view polling
-  if (view === 'setup' && !wasSetup) {
+  // Handle setup view polling (only after auth/config initialization)
+  if (view === 'setup' && !wasSetup && appInitialized) {
     startSetupPolling();
   } else if (wasSetup && view !== 'setup') {
     stopSetupPolling();
+    clearSetupSecrets();
   }
 }
 
@@ -198,7 +242,7 @@ function renderStats() {
 const photo = (plant, className) => {
   const last = latestCheckup(plant);
   return last
-    ? el('img', { class: className, src: `/photos/${last.photo}`, alt: `Latest photo of ${plant.name}`, loading: 'lazy' })
+    ? el('img', { class: className, src: photoUrl(last.photo), alt: `Latest photo of ${plant.name}`, loading: 'lazy' })
     : el('div', { class: `${className} placeholder`, role: 'img', 'aria-label': 'No photo yet' }, icon(LEAF));
 };
 
@@ -285,8 +329,20 @@ function formatSensorReading(sensor, defaultUnit) {
   };
 }
 
+function sensorUpdatedLine(iso) {
+  if (!iso) return null;
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return null;
+  const diffSec = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (diffSec < 60) return `Last updated ${diffSec <= 5 ? 'just now' : `${diffSec}s ago`}`;
+  const diffMin = Math.round(diffSec / 60);
+  if (diffMin < 60) return `Last updated ${plural(diffMin, 'min')} ago`;
+  return `Last updated ${shortDate(iso)}`;
+}
+
 function sensorsSection(plant) {
   const rawSensors = plant.sensors && typeof plant.sensors === 'object' ? plant.sensors : {};
+  const updatedText = sensorUpdatedLine(plant.sensorsUpdatedAt);
   return el('section', { class: 'card sensors-card', 'aria-labelledby': 'h-sensors' },
     el('h3', { id: 'h-sensors' }, 'Sensors'),
     el('ul', { class: 'sensor-grid' },
@@ -302,6 +358,7 @@ function sensorsSection(plant) {
             'aria-label': hasValue ? undefined : 'No reading',
           }, reading));
       })),
+    updatedText ? el('span', { class: 'muted small sensor-updated' }, updatedText) : null,
     el('a', {
       class: 'muted small',
       href: '#setup',
@@ -346,6 +403,7 @@ function healthChart(checkups) {
 
 let sensorPollTimer = null;
 let openPlantId = null;
+let sensorPollInFlight = false;
 
 function stopSensorPolling() {
   if (sensorPollTimer && typeof clearInterval === 'function') {
@@ -353,11 +411,14 @@ function stopSensorPolling() {
   }
   sensorPollTimer = null;
   openPlantId = null;
+  sensorPollInFlight = false;
 }
 
 async function refreshOpenSensors() {
   const dialog = $('#dlg-plant');
   if (!openPlantId || !dialog?.open) return stopSensorPolling();
+  if (sensorPollInFlight || document.hidden) return;
+  sensorPollInFlight = true;
   try {
     const latest = await api('GET', '/api/plants');
     plants = latest;
@@ -365,9 +426,14 @@ async function refreshOpenSensors() {
     const currentCard = $('#plant-detail .sensors-card');
     if (plant && currentCard && dialog.open) {
       currentCard.replaceWith(sensorsSection(plant));
+    } else if (!plant && dialog.open) {
+      dialog.close();
+      renderPlants();
     }
   } catch {
     // Ignore transient network hiccups during background polling.
+  } finally {
+    sensorPollInFlight = false;
   }
 }
 
@@ -424,7 +490,7 @@ function renderDetail(id) {
           el('div', { class: 'row' },
             button('Chat about this plant', 'secondary', () => go('chat', '#chat-plant')),
             button('Mark watered', 'secondary', (e) => act(e.currentTarget, async () => {
-              replacePlant(await api('PATCH', `/api/plants/${plant.id}`, { watered: true }));
+              replacePlant(await api('PATCH', `/api/plants/${encodeURIComponent(plant.id)}`, { watered: true }));
               renderDetail(plant.id);
               toast('Marked as watered');
             }))),
@@ -432,7 +498,7 @@ function renderDetail(id) {
             const target = e.currentTarget;
             if (!confirm(`Delete "${plant.name}" with all its checkups and photos? This cannot be undone.`)) return;
             act(target, async () => {
-              await api('DELETE', `/api/plants/${plant.id}`);
+              await api('DELETE', `/api/plants/${encodeURIComponent(plant.id)}`);
               storeChat(plant.id, []);
               plants = plants.filter((p) => p.id !== plant.id);
               dialog.close();
@@ -450,14 +516,14 @@ function renderDetail(id) {
         plant.checkups.length ? null : el('p', { class: 'muted' }, 'No checkups yet.'),
         [...plant.checkups].reverse().map((c) =>
           el('article', { class: 'card checkup' },
-            el('a', { href: `/photos/${c.photo}`, target: '_blank', rel: 'noopener' },
-              el('img', { src: `/photos/${c.photo}`, alt: `Photo from ${shortDate(c.date)}`, loading: 'lazy' })),
+            el('a', { href: photoUrl(c.photo), target: '_blank', rel: 'noopener noreferrer' },
+              el('img', { src: photoUrl(c.photo), alt: `Photo from ${shortDate(c.date)}`, loading: 'lazy' })),
             el('div', { class: 'checkup-text' },
               el('strong', {}, shortDate(c.date)),
               badge(c.status, c.health_score),
-              el('span', {}, c.report.summary),
-              c.report.backup_model ? el('span', { class: 'muted' }, 'Made by the backup model') : null,
-              c.report.problems.length
+              el('span', {}, c.report?.summary || ''),
+              c.report?.backup_model ? el('span', { class: 'muted' }, 'Made by the backup model') : null,
+              Array.isArray(c.report?.problems) && c.report.problems.length
                 ? el('span', { class: 'muted' }, c.report.problems.slice(0, 3).map((p) => p.name).join(', '))
                 : null),
             el('button', {
@@ -466,7 +532,7 @@ function renderDetail(id) {
                 const target = e.currentTarget;
                 if (!confirm(`Delete the checkup from ${shortDate(c.date)} and its photo?`)) return;
                 act(target, async () => {
-                  replacePlant(await api('DELETE', `/api/plants/${plant.id}/checkups/${c.id}`));
+                  replacePlant(await api('DELETE', `/api/plants/${encodeURIComponent(plant.id)}/checkups/${encodeURIComponent(c.id)}`));
                   renderDetail(plant.id);
                   toast('Checkup deleted');
                 });
@@ -592,6 +658,9 @@ function plantnetSection(report) {
 
 function renderReport(result) {
   const { report } = result;
+  const problems = Array.isArray(report.problems) ? report.problems : [];
+  const actions = Array.isArray(report.actions) ? report.actions : [];
+  const prevention = Array.isArray(report.prevention) ? report.prevention : [];
   if (!report.is_plant) {
     $('#an-result').replaceChildren(
       el('div', { class: 'card' }, el('h3', {}, "This doesn't look like a plant"),
@@ -600,6 +669,8 @@ function renderReport(result) {
     return;
   }
   const footer = el('div', { class: 'analyze-form' });
+  const disclaimerText = report.disclaimer
+    || 'AI analysis is a visual suggestion, not a confirmed diagnosis. Always verify plant conditions before applying fertilizers, pesticides, or fungicides, and follow product labels and local regulations.';
   $('#an-result').replaceChildren(...[
     backupNote(report),
     el('section', { class: 'card score-card' },
@@ -607,20 +678,26 @@ function renderReport(result) {
       badge(report.status),
       el('h2', {}, report.plant_name || 'Unknown plant'),
       report.scientific_name ? el('p', { class: 'sci' }, report.scientific_name) : null,
-      el('p', { class: 'muted small' }, `Confidence: ${report.confidence}`),
+      el('p', { class: 'muted small' }, `Confidence: ${report.confidence || 'low'}`),
+      report.confidence === 'low'
+        ? el('p', { class: 'note-box small' }, 'Low confidence — take a clearer close-up photo in bright, even light before taking action.')
+        : null,
       el('p', {}, report.summary)),
-    report.problems.length ? el('h3', {}, 'Problems') : null,
-    report.problems.map((p) =>
-      el('article', { class: 'card problem' },
+    problems.length ? el('h3', {}, 'Problems') : null,
+    problems.map((p) => {
+      const sev = Object.hasOwn(SEVERITY, p.severity) ? p.severity : 'medium';
+      return el('article', { class: 'card problem' },
         el('div', { class: 'problem-head' }, el('strong', {}, p.name),
-          el('span', { class: `badge sev-${p.severity}` }, SEVERITY[p.severity] ?? p.severity)),
+          el('span', { class: `badge sev-${sev}` }, SEVERITY[sev])),
         el('p', {}, el('strong', {}, 'What we see: '), p.evidence),
-        el('p', {}, el('strong', {}, 'Likely cause: '), p.likely_cause))),
-    listSection('What to do now', report.actions, 'ol', 'actions-list'),
-    listSection('Prevention', report.prevention, 'ul'),
+        el('p', {}, el('strong', {}, 'Likely cause: '), p.likely_cause));
+    }),
+    listSection('What to do now', actions, 'ol', 'actions-list'),
+    listSection('Prevention', prevention, 'ul'),
     report.watering_advice ? el('div', { class: 'note-box water' }, el('strong', {}, 'Watering'), el('p', {}, report.watering_advice)) : null,
     report.progress_note ? el('div', { class: 'note-box' }, el('strong', {}, 'Since last check'), el('p', {}, report.progress_note)) : null,
     plantnetSection(report),
+    el('p', { class: 'muted small disclaimer-note' }, disclaimerText),
     footer,
   ].flat().filter(Boolean));
   renderReportActions(footer, result);
@@ -667,7 +744,7 @@ async function saveCheckup(footer, result) {
       result.plantId = created.id;
       replacePlant(created);
     }
-    const plant = await api('POST', `/api/plants/${result.plantId}/checkups`,
+    const plant = await api('POST', `/api/plants/${encodeURIComponent(result.plantId)}/checkups`,
       { image: result.image, report: result.report, note: result.note });
     replacePlant(plant);
     result.savedId = plant.id;
@@ -694,7 +771,9 @@ function loadChat(id) {
   if (chatMemory.has(key)) return chatMemory.get(key);
   try {
     const saved = JSON.parse(localStorage.getItem(key));
-    return Array.isArray(saved) ? saved.filter((m) => m && typeof m.text === 'string') : [];
+    return Array.isArray(saved)
+      ? saved.filter((m) => m && (m.role === 'user' || m.role === 'model') && typeof m.text === 'string')
+      : [];
   } catch {
     return [];
   }
@@ -702,47 +781,70 @@ function loadChat(id) {
 
 function storeChat(id, messages) {
   const key = chatKey(id);
+  const trimmed = messages.slice(-100);
   try {
-    if (messages.length) localStorage.setItem(key, JSON.stringify(messages.slice(-100)));
+    if (trimmed.length) localStorage.setItem(key, JSON.stringify(trimmed));
     else localStorage.removeItem(key);
     chatMemory.delete(key);
   } catch {
-    chatMemory.set(key, messages);
+    chatMemory.set(key, trimmed);
   }
 }
 
-// Escapes first, so only the tags added here can ever become HTML.
-function markdown(source) {
-  const escaped = source.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-  const inline = (line) => line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  let html = '';
-  let inList = false;
+// Linear-time inline bold tokenizer producing plain strings and <strong> elements (zero innerHTML).
+function inlineNodes(line) {
+  const nodes = [];
+  let pos = 0;
+  while (pos < line.length) {
+    const start = line.indexOf('**', pos);
+    if (start === -1) {
+      nodes.push(line.slice(pos));
+      break;
+    }
+    const end = line.indexOf('**', start + 2);
+    if (end === -1) {
+      nodes.push(line.slice(pos));
+      break;
+    }
+    if (start > pos) nodes.push(line.slice(pos, start));
+    const bold = line.slice(start + 2, end);
+    if (bold) nodes.push(el('strong', {}, bold));
+    else nodes.push('****');
+    pos = end + 2;
+  }
+  return nodes;
+}
+
+// Builds safe DOM nodes directly (never assigns innerHTML).
+function markdownNodes(source) {
+  const nodes = [];
+  let list = null;
   let afterText = false;
-  for (const line of escaped.split('\n')) {
+  for (const line of String(source ?? '').split('\n')) {
     const bullet = /^\s*(?:[-•]|\*(?!\*))\s+(.*)$/.exec(line);
     if (bullet) {
-      if (!inList) html += '<ul>';
-      html += `<li>${inline(bullet[1])}</li>`;
-      inList = true;
+      if (!list) {
+        list = el('ul');
+        nodes.push(list);
+      }
+      list.append(el('li', {}, ...inlineNodes(bullet[1])));
       afterText = false;
-    } else if (inList && !line.trim()) {
+    } else if (list && !line.trim()) {
       // A blank line right after a list: the list's own spacing is enough.
-      html += '</ul>';
-      inList = false;
+      list = null;
     } else {
-      if (inList) html += '</ul>';
-      html += `${afterText ? '<br>' : ''}${inline(line)}`;
-      inList = false;
+      list = null;
+      if (afterText) nodes.push(el('br'));
+      nodes.push(...inlineNodes(line));
       afterText = true;
     }
   }
-  return inList ? `${html}</ul>` : html;
+  return nodes;
 }
 
 function bubble(message) {
-  const node = el('div', { class: `msg ${message.role}` });
-  node.innerHTML = markdown(message.text);
-  return node;
+  const role = message.role === 'user' ? 'user' : 'model';
+  return el('div', { class: `msg ${role}` }, ...markdownNodes(message.text));
 }
 
 function scrollChat() {
@@ -775,10 +877,15 @@ async function readReply(response, onText) {
     buffer = lines.pop();
     for (const line of lines) {
       if (!line.startsWith('data:')) continue;
-      const event = JSON.parse(line.slice(5));
+      let event;
+      try {
+        event = JSON.parse(line.slice(5));
+      } catch {
+        continue;
+      }
       if (event.error) throw apiError(event.error, event.code);
       if (event.done) return;
-      onText(event.t);
+      if (typeof event.t === 'string') onText(event.t);
     }
   }
   throw apiError('The connection closed before the reply finished.', 'interrupted');
@@ -807,7 +914,7 @@ async function sendMessage(raw) {
       const box = $('#msgs');
       const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
       answer += piece;
-      reply.innerHTML = `${markdown(answer)}<span class="cursor" aria-hidden="true"></span>`;
+      reply.replaceChildren(...markdownNodes(answer), el('span', { class: 'cursor', 'aria-hidden': 'true' }));
       if (atBottom) scrollChat();
     });
   } catch (err) {
@@ -907,7 +1014,8 @@ $('#chat-input').addEventListener('keydown', (e) => {
 $('#dlg-plant').addEventListener('close', stopSensorPolling);
 
 async function init() {
-  showView(location.hash.slice(1));
+  const initialView = location.hash.slice(1);
+  showView(initialView);
   try {
     const config = await api('GET', '/api/config');
     if (config.authEnabled && !config.user) {
@@ -915,51 +1023,82 @@ async function init() {
       return;
     }
     currentUser = config.user;
+    appInitialized = true;
     const logout = $('#logout-btn');
     logout.hidden = !currentUser;
     logout.addEventListener('click', handleLogout);
+    const userLabel = $('#user-label');
+    if (userLabel && currentUser) {
+      userLabel.textContent = currentUser.name || currentUser.email || '';
+      userLabel.hidden = !userLabel.textContent;
+    }
     await loadPlants();
+    setupPlants = plants;
     $('#demo-tag').hidden = !config.mock;
     if (config.blynkTemplateId && $('#s-blynk-template')) {
       $('#s-blynk-template').value = config.blynkTemplateId;
-      refreshSetupForm();
     }
-    if (!config.hasKey && !config.mock) {
+    if (config.authEnabled && typeof window.isSecureContext === 'boolean' && !window.isSecureContext) {
+      showBanner('Warning: This page is not loaded over HTTPS. Avoid entering sensitive passwords or tokens on untrusted networks.');
+    } else if (!config.hasKey && !config.mock) {
       showBanner('No AI key set. Add one to .env to use analysis and chat.');
     }
     renderChat();
+    initSetup();
+    if ($('#view-setup')?.classList.contains('active')) {
+      startSetupPolling();
+    }
   } catch (err) {
-    showBanner(friendly(err));
+    if (err.code !== 'authentication_required') showBanner(friendly(err));
   }
-  initSetup();
 }
 
 // ---------- setup view ----------
 
+const ALLOWED_DHT_PINS = [0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33];
+const ALLOWED_ADC1_PINS = [32, 33, 34, 35, 36, 37, 38, 39];
+
 async function loadSetupSketch() {
   try {
-    const res = await fetch('/arduino/watermi_blynk/watermi_blynk.ino');
+    const res = await fetch('/arduino/watermi_blynk/watermi_blynk.ino', { credentials: 'include' });
     if (res.ok) {
       setupSketch = await res.text();
       refreshSetupForm();
+    } else {
+      const hint = $('#download-hint');
+      if (hint) hint.textContent = 'Could not load the ESP32 sketch template from the server.';
     }
   } catch {
-    // The download button stays disabled without the sketch.
+    const hint = $('#download-hint');
+    if (hint) hint.textContent = 'Could not load the ESP32 sketch template from the server.';
   }
+}
+
+function escapeCppString(value) {
+  return String(value ?? '')
+    .replace(/[\r\n\0]/g, '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
 }
 
 function setConst(source, name, value) {
   return source.replace(
     new RegExp(`(const\\s+char\\*\\s+${name}\\s*=\\s*)"[^"]*";`),
-    (_, head) => `${head}"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}";`,
+    (_, head) => `${head}"${escapeCppString(value)}";`,
   );
 }
 
 function setStringDefine(source, name, value) {
   return source.replace(
     new RegExp(`(#define\\s+${name}\\s+)"[^"]*"`),
-    (_, head) => `${head}"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
+    (_, head) => `${head}"${escapeCppString(value)}"`,
   );
+}
+
+function safeInt(value, fallback, min, max) {
+  const n = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isSafeInteger(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
 }
 
 function setDefine(source, name, value) {
@@ -984,19 +1123,46 @@ function setBoolConst(source, name, value) {
 }
 
 function setupValues() {
+  const dhtPin = safeInt($('#s-dhtpin').value, 4, 0, 39);
+  const soilPin = safeInt($('#s-soilpin').value, 34, 32, 39);
+  const lightPin = safeInt($('#s-lightpin').value, 35, 32, 39);
   return {
     WIFI_SSID: $('#s-ssid').value.trim(),
     WIFI_PASSWORD: $('#s-pass').value,
     BLYNK_TEMPLATE_ID: $('#s-blynk-template').value.trim(),
-    BLYNK_AUTH_TOKEN: $('#s-blynk-auth').value,
-    SEND_INTERVAL_MS: $('#s-interval').value,
-    SOIL_DRY_RAW: $('#s-dry').value,
-    SOIL_WET_RAW: $('#s-wet').value,
+    BLYNK_AUTH_TOKEN: $('#s-blynk-auth').value.trim(),
+    SEND_INTERVAL_MS: safeInt($('#s-interval').value, 2000, 1000, 3_600_000),
+    SOIL_DRY_RAW: safeInt($('#s-dry').value, 4095, 0, 4095),
+    SOIL_WET_RAW: safeInt($('#s-wet').value, 0, 0, 4095),
     LIGHT_SENSOR_ENABLED: $('#s-light').value === 'false' ? 'false' : 'true',
-    DHTPIN: $('#s-dhtpin').value,
-    soilMoisturePin: $('#s-soilpin').value,
-    lightPin: $('#s-lightpin').value,
+    DHTPIN: ALLOWED_DHT_PINS.includes(dhtPin) ? dhtPin : 4,
+    soilMoisturePin: ALLOWED_ADC1_PINS.includes(soilPin) ? soilPin : 34,
+    lightPin: ALLOWED_ADC1_PINS.includes(lightPin) ? lightPin : 35,
   };
+}
+
+function setupValidationError(v) {
+  if (!setupSketch || !v.WIFI_SSID || !v.BLYNK_TEMPLATE_ID || !v.BLYNK_AUTH_TOKEN) {
+    return 'Enter Wi-Fi, Blynk Template ID & Auth Token, then click Download sketch. Keep the downloaded .ino file private — it contains your Wi-Fi password and Blynk token.';
+  }
+  if (/[\r\n\0]/.test(v.WIFI_SSID) || /[\r\n\0]/.test(v.WIFI_PASSWORD)) {
+    return 'Wi-Fi credentials cannot contain line breaks.';
+  }
+  if (!/^[A-Za-z0-9_-]{3,64}$/.test(v.BLYNK_TEMPLATE_ID)) {
+    return 'Blynk Template ID may only contain letters, numbers, hyphens, and underscores.';
+  }
+  if (!/^[A-Za-z0-9_-]{8,120}$/.test(v.BLYNK_AUTH_TOKEN)) {
+    return 'Blynk Auth Token may only contain letters, numbers, hyphens, and underscores.';
+  }
+  if (v.SOIL_DRY_RAW === v.SOIL_WET_RAW) {
+    return 'Soil dry raw value and soil wet raw value must be different.';
+  }
+  const usedPins = [v.DHTPIN, v.soilMoisturePin];
+  if (v.LIGHT_SENSOR_ENABLED === 'true') usedPins.push(v.lightPin);
+  if (new Set(usedPins).size !== usedPins.length) {
+    return 'Each enabled sensor must use a different GPIO pin.';
+  }
+  return '';
 }
 
 function buildSketch() {
@@ -1027,29 +1193,13 @@ function buildSketch() {
 
 function refreshSetupForm() {
   const v = setupValues();
-  const preview = $('#s-preview');
-  if (preview) {
-    preview.textContent = [
-      `WIFI_SSID           = "${v.WIFI_SSID}"`,
-      `WIFI_PASSWORD       = "${v.WIFI_PASSWORD ? '********' : ''}"`,
-      `BLYNK_TEMPLATE_ID   = "${v.BLYNK_TEMPLATE_ID}"`,
-      `BLYNK_AUTH_TOKEN    = "${v.BLYNK_AUTH_TOKEN ? '********' : ''}"`,
-      `SEND_INTERVAL_MS    = ${v.SEND_INTERVAL_MS}`,
-      `SOIL_DRY_RAW        = ${v.SOIL_DRY_RAW}`,
-      `SOIL_WET_RAW        = ${v.SOIL_WET_RAW}`,
-      `LIGHT_SENSOR_ENABLED= ${v.LIGHT_SENSOR_ENABLED}`,
-      `DHTPIN              = ${v.DHTPIN}`,
-      `soilMoisturePin     = ${v.soilMoisturePin}`,
-      `lightPin            = ${v.lightPin}`,
-    ].join('\n');
-  }
   const plantId = $('#s-plant')?.value || '';
   const plant = setupPlants.find((p) => p.id === plantId);
   const connectBtn = $('#s-connect');
   const disconnectBtn = $('#s-disconnect');
   const connectHint = $('#connect-hint');
   if (connectBtn) {
-    connectBtn.disabled = !(plantId && v.BLYNK_AUTH_TOKEN.trim());
+    connectBtn.disabled = !(plantId && v.BLYNK_AUTH_TOKEN);
     connectBtn.textContent = plant?.blynkLinked ? 'Update Blynk token' : 'Connect Blynk to plant';
   }
   if (disconnectBtn) disconnectBtn.hidden = !plant?.blynkLinked;
@@ -1058,7 +1208,13 @@ function refreshSetupForm() {
       ? `Blynk is connected to ${plant.name}. WaterMI pulls live sensor readings automatically.`
       : 'Paste your Blynk Auth Token and click Connect so WaterMI reads live data automatically.';
   }
-  $('#s-download').disabled = !(setupSketch && v.WIFI_SSID && v.BLYNK_TEMPLATE_ID && v.BLYNK_AUTH_TOKEN);
+  const err = setupValidationError(v);
+  $('#s-download').disabled = Boolean(err);
+  const downloadHint = $('#download-hint');
+  if (downloadHint && err) {
+    downloadHint.textContent = err;
+    downloadHint.className = 'muted small mt-8';
+  }
 }
 
 function renderLiveSetup() {
@@ -1074,9 +1230,10 @@ function renderLiveSetup() {
   }
   const sensors = plant.sensors ?? {};
   const any = SETUP_SENSORS.some(([key]) => sensors[key]?.connected);
+  const updatedText = sensorUpdatedLine(plant.sensorsUpdatedAt);
   if (msg) {
     msg.textContent = any
-      ? 'The board is sending data. This page refreshes every 3 seconds.'
+      ? `The board is sending data. ${updatedText ? `${updatedText}. ` : ''}Refreshes every 3 seconds.`
       : 'Waiting for the board. Readings appear here a few seconds after it connects.';
   }
   for (const [key, label] of SETUP_SENSORS) {
@@ -1089,38 +1246,44 @@ function renderLiveSetup() {
     name.textContent = label;
     const value = document.createElement('strong');
     value.textContent = hasValue ? `${s.value}${s.unit === 'lux' ? ' lux' : (s.unit ?? '')}` : '—';
-    const badge = document.createElement('span');
-    badge.className = `badge ${connected ? 'healthy' : 'none'}`;
-    badge.textContent = connected ? 'Connected' : 'Not connected';
-    item.append(name, value, badge);
+    const statusBadge = document.createElement('span');
+    statusBadge.className = `badge ${connected ? 'healthy' : 'none'}`;
+    statusBadge.textContent = connected ? 'Connected' : 'Not connected';
+    item.append(name, value, statusBadge);
     box.append(item);
   }
 }
 
+function syncSetupPlantSelect(list) {
+  setupPlants = list;
+  const select = $('#s-plant');
+  if (select) {
+    const current = select.value;
+    select.replaceChildren(...setupPlants.map((p) => {
+      const option = document.createElement('option');
+      option.value = p.id;
+      option.textContent = p.name;
+      return option;
+    }));
+    if (setupPlants.some((p) => p.id === current)) select.value = current;
+  }
+  const noplant = $('#s-noplant');
+  if (noplant) noplant.hidden = setupPlants.length > 0;
+  refreshSetupForm();
+  renderLiveSetup();
+}
+
 async function loadSetupPlants() {
+  if (setupPollInFlight || document.hidden) return;
+  setupPollInFlight = true;
   try {
-    const res = await fetch('/api/plants', { credentials: 'include' });
-    if (!res.ok) return;
-    const latest = await res.json();
-    const first = !setupPlants.length;
-    setupPlants = latest;
-    const select = $('#s-plant');
-    if (select) {
-      const current = select.value;
-      select.replaceChildren(...setupPlants.map((p) => {
-        const option = document.createElement('option');
-        option.value = p.id;
-        option.textContent = p.name;
-        return option;
-      }));
-      if (setupPlants.some((p) => p.id === current)) select.value = current;
-    }
-    const noplant = $('#s-noplant');
-    if (noplant) noplant.hidden = setupPlants.length > 0;
-    if (first) refreshSetupForm();
-    renderLiveSetup();
+    const latest = await api('GET', '/api/plants');
+    plants = latest;
+    syncSetupPlantSelect(latest);
   } catch {
-    // The next poll tries again.
+    // The next poll tries again (authentication_required redirects inside request()).
+  } finally {
+    setupPollInFlight = false;
   }
 }
 
@@ -1129,12 +1292,11 @@ function stopSetupPolling() {
     clearInterval(setupPollTimer);
   }
   setupPollTimer = null;
-  setupViewActive = false;
+  setupPollInFlight = false;
 }
 
 function startSetupPolling() {
   stopSetupPolling();
-  setupViewActive = true;
   loadSetupPlants();
   if (typeof setInterval === 'function') {
     setupPollTimer = setInterval(loadSetupPlants, 3000);
@@ -1142,10 +1304,7 @@ function startSetupPolling() {
 }
 
 function populatePinDropdowns() {
-  const dhtPins = [0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33];
-  const adc1Pins = [32, 33, 34, 35, 36, 37, 38, 39];
-
-  function fillSelect(id, options, defaultVal) {
+  function fillSelectPin(id, options, defaultVal) {
     const sel = $(id);
     sel.replaceChildren(...options.map((n) => {
       const opt = document.createElement('option');
@@ -1157,9 +1316,9 @@ function populatePinDropdowns() {
     sel.value = String(defaultVal);
   }
 
-  fillSelect('#s-dhtpin', dhtPins, 4);
-  fillSelect('#s-soilpin', adc1Pins, 34);
-  fillSelect('#s-lightpin', adc1Pins, 35);
+  fillSelectPin('#s-dhtpin', ALLOWED_DHT_PINS, 4);
+  fillSelectPin('#s-soilpin', ALLOWED_ADC1_PINS, 34);
+  fillSelectPin('#s-lightpin', ALLOWED_ADC1_PINS, 35);
 }
 
 function updateWiringDiagram() {
@@ -1171,12 +1330,15 @@ function updateWiringDiagram() {
 function initSetup() {
   populatePinDropdowns();
   updateWiringDiagram();
+  syncSetupPlantSelect(plants);
   for (const id of ['#s-ssid', '#s-pass', '#s-blynk-template', '#s-blynk-auth', '#s-interval', '#s-dry', '#s-wet', '#s-light', '#s-dhtpin', '#s-soilpin', '#s-lightpin']) {
     $(id).addEventListener('input', refreshSetupForm);
   }
   const plantSelect = $('#s-plant');
   if (plantSelect) {
     plantSelect.addEventListener('change', () => {
+      const authInput = $('#s-blynk-auth');
+      if (authInput) authInput.value = '';
       refreshSetupForm();
       renderLiveSetup();
     });
@@ -1189,11 +1351,10 @@ function initSetup() {
       if (!plantId || !token) return;
       connectBtn.disabled = true;
       try {
-        const updated = await api('PATCH', `/api/plants/${plantId}`, { blynkToken: token });
+        const updated = await api('PATCH', `/api/plants/${encodeURIComponent(plantId)}`, { blynkToken: token });
         replacePlant(updated);
-        setupPlants = plants;
-        refreshSetupForm();
-        renderLiveSetup();
+        $('#s-blynk-auth').value = '';
+        syncSetupPlantSelect(plants);
         toast(`Connected Blynk to ${updated.name}`);
       } catch (err) {
         toast(friendly(err));
@@ -1209,11 +1370,9 @@ function initSetup() {
       if (!plantId) return;
       disconnectBtn.disabled = true;
       try {
-        const updated = await api('PATCH', `/api/plants/${plantId}`, { blynkToken: '' });
+        const updated = await api('PATCH', `/api/plants/${encodeURIComponent(plantId)}`, { blynkToken: '' });
         replacePlant(updated);
-        setupPlants = plants;
-        refreshSetupForm();
-        renderLiveSetup();
+        syncSetupPlantSelect(plants);
         toast(`Disconnected Blynk from ${updated.name}`);
       } catch (err) {
         toast(friendly(err));
@@ -1228,24 +1387,28 @@ function initSetup() {
     $(id).addEventListener('change', updateWiringDiagram);
   }
   $('#s-download').addEventListener('click', () => {
+    const err = setupValidationError(setupValues());
+    if (err) {
+      toast(err);
+      return;
+    }
     const sketch = buildSketch();
     const url = URL.createObjectURL(new Blob([sketch], { type: 'text/plain' }));
     const link = document.createElement('a');
     link.href = url;
     link.download = 'watermi_blynk.ino';
     link.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
     // Provide feedback
     const hint = $('#download-hint');
-    hint.textContent = 'Sketch downloaded! Open it in Arduino IDE to flash your ESP32.';
-    hint.className = 'muted small ok-bg';
-    // Re-enable after a moment so they can download again
-    setTimeout(() => { hint.textContent = 'Enter Wi-Fi, Blynk Template ID & Auth Token, then click Download sketch.'; hint.className = 'muted small'; }, 5000);
+    hint.textContent = 'Sketch downloaded! Keep watermi_blynk.ino private — it contains your Wi-Fi password and Blynk Auth Token.';
+    hint.className = 'muted small mt-8 ok-bg';
+    setTimeout(() => {
+      hint.textContent = 'Enter Wi-Fi, Blynk Template ID & Auth Token, then click Download sketch. Keep the downloaded .ino file private — it contains your Wi-Fi password and Blynk token.';
+      hint.className = 'muted small mt-8';
+    }, 6000);
   });
   loadSetupSketch();
-  loadSetupPlants();
 }
-
-// ---------- analysis ----------
 
 init();

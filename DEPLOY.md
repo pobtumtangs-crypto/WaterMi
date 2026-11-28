@@ -1,96 +1,81 @@
-# Deploying WaterMI (AI + Live ESP32 Sensors)
+# Deploying WaterMI (AI + Live ESP32 Sensors via Blynk TLS)
 
-WaterMI is packaged with a `Dockerfile`, `railway.toml`, and `fly.toml` so it deploys cleanly with **persistent storage** for saved plants/photos (`/data`), **AI keys** via environment secrets, and **HTTPS** for your ESP32.
-
----
-
-## Render
-
-The Render Blueprint uses Docker and checks `/healthz`. For an existing Render service, set the health check path and environment variables in its dashboard before deploying the new commit.
-
-1. Run `supabase-schema.sql` in the project's Supabase SQL Editor. Account-owned plants, checkups, and photos use Supabase. Existing local `data/db.json` records need an explicit account migration.
-2. In Render, set `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and a random `SESSION_SECRET`. The Blueprint generates the session secret for new services. Keep existing AI keys in Render and leave `MOCK_AI` disabled.
-3. In Supabase Authentication → URL Configuration, set the Site URL to the deployed origin and add that origin with `/auth/callback` to Redirect URLs. Keep the Email provider enabled and disable the Google provider if it was previously configured.
-4. Deploy the linked GitHub branch. Check `/healthz`, sign in, and confirm the plant list loads.
-
-Web sessions are stored in AES-256-GCM encrypted HttpOnly cookies signed with `SESSION_SECRET`, so users stay signed in across Render restarts and spin-downs. API routes also accept `Authorization: Bearer <supabase-jwt>`. All plant data, checkups, and photos live in Supabase (no local disk required). Cloud sensor polling uses the Blynk token linked to each plant. The older device push endpoints require an authenticated session or Bearer JWT in this account-based configuration.
-
-## Option A: Deploy on Railway (Recommended — Easiest)
-
-1. **Push `watermi/` to a GitHub repository** (note: `.gitignore` already keeps `.env`, `data/`, and `node_modules/` private and out of Git):
-   ```bash
-   cd /home/pobtum/Downloads/watermi-project/watermi
-   git init
-   git add .
-   git commit -m "Initial WaterMI deploy"
-   # Create a private repo on GitHub, then:
-   git remote add origin https://github.com/<your-username>/<your-repo>.git
-   git branch -M main
-   git push -u origin main
-   ```
-2. Go to [railway.com](https://railway.com) -> **New Project** -> **Deploy from GitHub repo** -> select your repo.
-   - Railway automatically detects `Dockerfile` and `railway.toml`.
-3. **Add Persistent Storage** (so plants and photos are never lost on redeploy):
-   - Open your service -> **Volumes** -> **Add Volume** -> set Mount Path to `/data`.
-4. **Add your Environment Variables** (Service -> **Variables**):
-   - `GEMINI_API_KEY` = your Google AI Studio key
-   - `GROQ_API_KEY` = *(optional)* your Groq backup key
-   - `PLANTNET_API_KEY` = *(optional)* your Pl@ntNet key
-   - `DATA_DIR` = `/data`
-   - `HOST` = `0.0.0.0`
-   - `SENSOR_KEY` = *(optional)* a secret password if you want only your ESP32 to post sensor readings
-5. **Generate a Public Domain**:
-   - Service -> **Settings** -> **Networking** -> **Generate Domain** (e.g. `https://watermi-production.up.railway.app`).
-6. Open your new HTTPS URL — WaterMI and AI analysis/chat are live!
+WaterMI ships with a hardened non-root `Dockerfile`, `render.yaml`, `railway.toml`, and `fly.toml`. In production (`NODE_ENV=production`), all accounts, plants, checkups, session revocations, and photos live in **Supabase** (no local `/data` disk volume required).
 
 ---
 
-## Option B: Deploy on Fly.io (CLI)
+## Required Production Environment Variables
 
-1. Install the Fly CLI:
-   ```bash
-   curl -L https://fly.io/install.sh | sh
-   fly auth login
-   ```
-2. Launch the app from `watermi/` (change `app = "watermi-app"` in `fly.toml` to a unique name):
+WaterMI fails fast on startup in production unless all of the following are configured:
+
+- `SUPABASE_URL` — Supabase project URL (`https://<ref>.supabase.co`)
+- `SUPABASE_ANON_KEY` — Supabase public anon key
+- `SESSION_SECRET` — Random secret, **at least 32 characters** (`openssl rand -hex 32`)
+- `PUBLIC_ORIGIN` — Canonical HTTPS origin (e.g., `https://watermi.onrender.com`; Render provides `RENDER_EXTERNAL_URL` automatically)
+- `GEMINI_API_KEY` — Google AI Studio API key (for analysis and chat)
+
+Optional environment variables:
+- `DATA_ENCRYPTION_KEY` — Dedicated AES-256-GCM key for encrypting stored per-plant Blynk tokens (falls back to key derived from `SESSION_SECRET`)
+- `GROQ_API_KEY`, `PLANTNET_API_KEY` — Optional AI fallback & recognition hints
+- `SENSOR_KEY` — Optional shared secret required in the `x-sensor-key` header for sensor push/webhook routes
+- `BLYNK_TEMPLATE_ID` — Optional default Blynk Template ID pre-filled on the Sensors tab
+
+---
+
+## Database Setup (Supabase)
+
+Apply all migrations in `supabase/migrations/` (single source of truth, synced with `supabase-schema.sql`) via `supabase db push` or the Supabase SQL Editor:
+1. `20261127063550_initial_schema.sql` — `plants` & `checkups` tables and initial RLS
+2. `20261127063600_storage_bucket.sql` — private `plant-photos` bucket and storage policies
+3. `20261128000000_security_hardening.sql` — strict `CHECK` constraints, `WITH CHECK` RLS hardening, ownership immutability triggers, composite indexes, `revoked_sessions` table, and tightened storage path policies
+
+In Supabase **Authentication → URL Configuration**, set **Site URL** to your deployed HTTPS origin and add `<origin>/auth/callback` to **Redirect URLs**.
+
+---
+
+## Option A: Render (Active Blueprint)
+
+1. Connect the GitHub repo and deploy using `render.yaml` (`healthCheckPath: /healthz`).
+2. Set `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `GEMINI_API_KEY` (and optional keys) in the Render dashboard; `SESSION_SECRET` and `DATA_ENCRYPTION_KEY` are auto-generated by the Blueprint. Leave `MOCK_AI` unset.
+3. Verify `GET /healthz` returns `200`, sign in, and confirm plants load.
+
+## Option B: Railway
+
+1. Push `watermi/` to GitHub and create a Railway service from the repo (`railway.toml` uses `Dockerfile` and checks `/healthz`).
+2. Set all required production variables above (`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SESSION_SECRET`, `PUBLIC_ORIGIN`, `GEMINI_API_KEY`).
+
+## Option C: Fly.io
+
+1. Launch from `watermi/`:
    ```bash
    cd /home/pobtum/Downloads/watermi-project/watermi
    fly launch --no-deploy --copy-config
    ```
-3. Create the persistent volume for saved plants and photos:
+2. Set secrets:
    ```bash
-   fly volumes create watermi_data --region sin --size 1
+   fly secrets set \
+     SUPABASE_URL="https://<ref>.supabase.co" \
+     SUPABASE_ANON_KEY="<anon-key>" \
+     SESSION_SECRET="$(openssl rand -hex 32)" \
+     DATA_ENCRYPTION_KEY="$(openssl rand -hex 32)" \
+     PUBLIC_ORIGIN="https://<your-app>.fly.dev" \
+     GEMINI_API_KEY="<gemini-key>"
    ```
-4. Set your AI keys as Fly secrets:
-   ```bash
-   fly secrets set GEMINI_API_KEY="your-gemini-key"
-   # Optional backups / plant ID / sensor protection:
-   fly secrets set GROQ_API_KEY="your-groq-key" PLANTNET_API_KEY="your-plantnet-key"
-   # Optional:
-   # fly secrets set SENSOR_KEY="choose-a-secret"
-   ```
-5. Deploy:
-   ```bash
-   fly deploy
-   ```
-   Your live URL will be `https://<your-app-name>.fly.dev`.
+3. Deploy with `fly deploy`.
 
 ---
 
-## Connect Your ESP32 to the Deployed Website
+## Connect Your ESP32 (Blynk Cloud over TLS)
 
-1. Open your deployed WaterMI website and add a plant (or view an existing one).
-2. Get its `PLANT_ID`:
-   ```bash
-   curl -s https://<your-live-domain>/api/plants | node -e "for (const p of JSON.parse(require('fs').readFileSync(0,'utf8'))) console.log(p.id, '-', p.name);"
-   ```
-3. Open `arduino/watermi_esp32/watermi_esp32.ino` in Arduino IDE and update:
-   ```cpp
-   const char* WIFI_SSID     = "YOUR_WIFI_NAME";
-   const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+1. Open your deployed WaterMI website, sign in, and open the **Sensors** tab.
+2. Enter your 2.4 GHz Wi-Fi credentials, Blynk Template ID, and Device Auth Token, select your GPIO pins, and click **Download sketch** (`watermi_blynk.ino`).
+   - Keep the downloaded `.ino` file private — it contains your Wi-Fi password and Blynk Auth Token.
+3. Flash `watermi_blynk.ino` in Arduino IDE (uses `BlynkSimpleEsp32_SSL.h` for TLS encryption on port 443 and includes hardware watchdog recovery).
+4. Click **Connect Blynk to plant** on the Sensors tab so WaterMI pulls live sensor readings automatically.
 
-   const char* SERVER_URL    = "https://<your-live-domain>";
-   const char* PLANT_ID      = "YOUR_PLANT_ID";
-   const char* SENSOR_KEY    = ""; // Leave empty unless you set SENSOR_KEY in cloud env vars
-   ```
-4. Upload to your ESP32! It automatically uses HTTPS (`WiFiClientSecure`) when `SERVER_URL` starts with `https://`, so your ESP32 can send live readings from **any Wi-Fi network**, anywhere.
+---
+
+## Operations: Backups & Secret Rotation
+
+- **Backups:** Enable Supabase daily backups (and Point-in-Time Recovery on Pro plans) for Postgres, and periodically back up the `plant-photos` storage bucket. Test restore procedures before relying on them.
+- **Secret rotation:** Rotate `GEMINI_API_KEY`, `GROQ_API_KEY`, `PLANTNET_API_KEY`, `SESSION_SECRET`, and Supabase/Render management tokens immediately if suspected exposed, and on a regular schedule. Note that rotating `SESSION_SECRET` signs out active cookie sessions; set a separate `DATA_ENCRYPTION_KEY` so rotating `SESSION_SECRET` does not invalidate encrypted `blynk_token` records.

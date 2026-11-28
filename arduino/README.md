@@ -112,17 +112,11 @@ Every probe reads a little differently.
 
 ## How it works
 
-The sketch sends sensor values to Blynk virtual pins every 2 seconds using `Blynk.virtualWrite()`. Blynk handles the cloud connection, device management, and dashboard widgets.
+The sketch sends validated sensor values to Blynk virtual pins over **TLS (`BlynkSimpleEsp32_SSL.h`, port 443)** using `Blynk.virtualWrite()` with an ESP32 hardware watchdog (`esp_task_wdt`) and non-blocking Wi-Fi/Blynk exponential backoff.
 
-- Values appear in real-time on Blynk web/mobile dashboards.
-- If Wi-Fi drops, the sketch reconnects automatically.
-- `null`/NaN values are not sent (sensor shows as disconnected in Blynk).
-
-Test without hardware (simulate device in Blynk):
-
-```bash
-# Not needed — Blynk handles device communication
-```
+- Values appear in real-time on WaterMI and Blynk dashboards.
+- If Wi-Fi drops (including at boot), the sketch reconnects automatically without hanging.
+- Invalid/out-of-range DHT22 readings are printed as `ERR` on Serial Monitor and omitted from writes (note: Blynk Cloud retains its last written virtual-pin value while the device stays online; check the "Last updated" timestamp and sensor wiring if readings stop changing).
 
 ## Troubleshooting
 
@@ -131,7 +125,7 @@ Test without hardware (simulate device in Blynk):
 | Never connects to Wi-Fi | Use a 2.4 GHz network and check the name and password. |
 | "Invalid Auth Token" in Serial Monitor | Re-check Template ID & Auth Token from Blynk Console. They must match the device. |
 | Blynk shows "Device offline" | Check Wi-Fi, restart ESP32, verify Auth Token matches the device in Blynk. |
-| Humidity and temperature show NaN | Check the DHT22 data wire on selected GPIO and its 3.3V and GND. Add 10 kΩ pull-up if bare sensor. |
+| Humidity and temperature show ERR | Check the DHT22 data wire on selected GPIO and its 3.3V and GND. Add 10 kΩ pull-up if bare sensor. |
 | Soil moisture stuck at 0% or 100% | Calibrate SOIL_DRY_RAW / SOIL_WET_RAW in Advanced options (measure in dry air and water). |
 | All sensors drop after ~30s | Board stopped — check power supply (use USB or stable 5V) & Wi-Fi stability. |
 | "Blynk library not found" | Install Blynk library in Arduino IDE: Sketch → Include Library → Manage Libraries → search "Blynk". |

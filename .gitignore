@@ -1,6 +1,16 @@
 node_modules/
 .env
+.env.*
+!.env.example
 data/
 cookies*.txt
 server.log
 HANDOFF.md
+DEPLOY_SSH_KEY.txt
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+supabase/.temp/
+.vscode/
+.claude/

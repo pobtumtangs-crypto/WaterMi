@@ -5,7 +5,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import vm from 'node:vm';
-import { createApp, SENSOR_UNITS, normalizeSensors, plantFacts } from '../server.js';
+import { createApp, SENSOR_UNITS, normalizeSensors, plantFacts, validateBlynkServer, AI_DISCLAIMER } from '../server.js';
 import { createSupabaseFactory } from '../supabase.js';
 
 const IMAGE = `data:image/jpeg;base64,${Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0]).toString('base64')}`;
@@ -66,12 +66,21 @@ test('login protects the dashboard and isolates plant data between sessions', as
   assert.equal((await call('GET', '/api/plants')).status, 401);
 
   const credentials = { email: 'grower@example.com', password: 'testing-123' };
+  // Login must not auto-register unknown emails
+  assert.equal((await call('POST', '/api/auth/login', credentials)).status, 401);
+  // Short passwords (< 8 chars) are rejected
+  assert.equal((await call('POST', '/api/auth/register', { email: credentials.email, password: 'short' })).status, 400);
+
+  const reg = await call('POST', '/api/auth/register', credentials);
+  assert.equal(reg.status, 201);
   const login = await call('POST', '/api/auth/login', credentials);
   assert.equal(login.status, 200);
   const signedIn = { cookie: login.headers.get('set-cookie').split(';')[0] };
   assert.match(login.headers.get('set-cookie'), /HttpOnly; SameSite=Lax/);
   assert.match((await call('GET', '/', undefined, signedIn)).body, /<title>WaterMI<\/title>/);
-  assert.equal((await call('POST', '/api/plants', { name: 'Basil' }, signedIn)).status, 201);
+  const created = await call('POST', '/api/plants', { name: 'Basil' }, signedIn);
+  assert.equal(created.status, 201);
+  assert.equal('userId' in created.body, false);
   assert.equal((await call('GET', '/api/plants', undefined, signedIn)).body.length, 1);
 
   const second = await call('POST', '/api/auth/register', { ...credentials, email: 'other@example.com' });
@@ -93,6 +102,9 @@ test('Supabase email login and sign-up establish secure sessions with user-scope
   const authClient = createSupabaseFactory(provider, 'public-key', async (input, init) => {
     const url = new URL(input);
     const headers = new Headers(init.headers);
+    if (url.pathname === '/rest/v1/revoked_sessions') {
+      return Response.json([]);
+    }
     if (url.pathname === '/rest/v1/plants') {
       assert.equal(headers.get('authorization'), 'Bearer example-access-token');
       assert.equal(url.searchParams.get('user_id'), `eq.${user.id}`);
@@ -138,7 +150,7 @@ test('Supabase email login and sign-up establish secure sessions with user-scope
   const credentials = { email: user.email, password: 'testing-123' };
   const login = await call('POST', '/api/auth/login', credentials, headers);
   assert.equal(login.status, 200);
-  assert.match(login.headers.get('set-cookie'), /HttpOnly; Secure; SameSite=Lax/);
+  assert.match(login.headers.get('set-cookie'), /^__Host-watermi\.sid=.*HttpOnly; Secure; SameSite=Lax/);
   const signedIn = { ...headers, cookie: login.headers.get('set-cookie').split(';')[0] };
   assert.deepEqual((await call('GET', '/api/plants', undefined, signedIn)).body, []);
 
@@ -158,16 +170,27 @@ test('Supabase email login and sign-up establish secure sessions with user-scope
   assert.deepEqual((await call('GET', '/api/plants', undefined, confirmed)).body, []);
 });
 
-test('Supabase mode persists sessions across restarts, supports Bearer JWTs, skips local db.json, and handles OTP/implicit callbacks', async (t) => {
+test('Supabase mode persists sessions across restarts, enforces persistent logout revocation, supports Bearer JWTs, skips local db.json, and rejects implicit token callbacks', async (t) => {
   const origin = 'https://watermi.example.com';
   const provider = 'https://project.supabase.co';
   const user = { id: '22222222-2222-4222-8222-222222222222', email: 'farmer@example.com' };
   const secret = 'test-render-session-secret-0123456789';
   let revoked = 0;
+  const revokedHashes = new Set();
 
   const makeAuthClient = () => createSupabaseFactory(provider, 'public-key', async (input, init) => {
     const url = new URL(input);
     const headers = new Headers(init.headers);
+    if (url.pathname === '/rest/v1/revoked_sessions') {
+      if ((init.method || 'GET').toUpperCase() === 'POST') {
+        const rows = JSON.parse(init.body);
+        for (const r of Array.isArray(rows) ? rows : [rows]) revokedHashes.add(r.token_hash);
+        return Response.json([]);
+      }
+      const inParam = url.searchParams.get('token_hash') || '';
+      const matched = [...revokedHashes].filter((h) => inParam.includes(h)).map((h) => ({ token_hash: h }));
+      return Response.json(matched);
+    }
     if (url.pathname === '/rest/v1/plants') {
       assert.equal(headers.get('authorization'), 'Bearer jwt-access-token');
       assert.equal(url.searchParams.get('user_id'), `eq.${user.id}`);
@@ -208,16 +231,19 @@ test('Supabase mode persists sessions across restarts, supports Bearer JWTs, ski
   // Bearer Supabase JWT works without a cookie.
   assert.deepEqual((await second.call('GET', '/api/plants', undefined, { authorization: 'Bearer jwt-access-token' })).body, []);
 
-  // OTP email confirmation & implicit hash callbacks establish a session.
+  // OTP email confirmation works; deprecated implicit accessToken callback is rejected.
   const otp = await second.call('POST', '/api/auth/callback', { tokenHash: 'hash-123', type: 'signup' }, headers);
   assert.equal(otp.status, 200);
   const implicit = await second.call('POST', '/api/auth/callback', { accessToken: 'jwt-access-token', refreshToken: 'jwt-refresh-token' }, headers);
-  assert.equal(implicit.status, 200);
+  assert.equal(implicit.status, 400);
 
-  // Logout revokes the token in Supabase and blocks cookie replay.
+  // Logout revokes the token in Supabase + revoked_sessions and blocks cookie/Bearer replay even on Instance 3 (restart)!
   assert.equal((await second.call('POST', '/api/auth/logout', undefined, { ...headers, cookie })).status, 200);
   assert.equal(revoked, 1);
   assert.equal((await second.call('GET', '/api/plants', undefined, { ...headers, cookie })).status, 401);
+  const third = await start(t, { authClient: makeAuthClient(), sessionSecret: secret, secureCookies: true, publicOrigin: origin });
+  assert.equal((await third.call('GET', '/api/plants', undefined, { ...headers, cookie })).status, 401);
+  assert.equal((await third.call('GET', '/api/plants', undefined, { authorization: 'Bearer jwt-access-token' })).status, 401);
 });
 
 test('plant create, update, watering and validation', async (t) => {
@@ -360,9 +386,12 @@ test('chat streams chunks and includes the plant, latest checkup and photo', asy
   });
   assert.deepEqual(events(res.body), [{ t: 'Hello ' }, { t: 'สวัสดี' }, { done: true }]);
   assert.match(calls[0].url, /gemini-3\.5-flash-lite:streamGenerateContent\?alt=sse$/);
-  assert.match(calls[0].body.systemInstruction.parts[0].text, /Basil plot.*wilting/s);
+  // Plant context must live in delimited user content, NEVER inside systemInstruction
+  assert.doesNotMatch(calls[0].body.systemInstruction.parts[0].text, /Basil plot/);
   assert.equal(calls[0].body.contents[0].role, 'user');
+  assert.match(calls[0].body.contents[0].parts[0].text, /<plant_record_json>[\s\S]*Basil plot[\s\S]*wilting[\s\S]*<\/plant_record_json>/);
   assert.ok(calls[0].body.contents[0].parts.some((p) => p.inlineData));
+  assert.equal(calls[0].body.generationConfig.maxOutputTokens, 512);
 });
 
 test('an error during the stream is sent as an SSE error event', async (t) => {
@@ -1008,12 +1037,14 @@ test('plantFacts includes connected non-null sensors with lux spacing and omits 
 
   await chatApp.call('POST', '/api/chat', { plantId: cp1.id, history });
   const c1Sys = chatMock.calls[0].body.systemInstruction.parts[0].text;
-  const c1Facts = JSON.parse(c1Sys.split('\nThe user is asking about this saved plant:\n')[1]);
+  assert.doesNotMatch(c1Sys, /<plant_record_json>|Basil/);
+  const c1Text = chatMock.calls[0].body.contents[0].parts[0].text;
+  const c1Facts = JSON.parse(c1Text.match(/<plant_record_json>\n([\s\S]*?)\n<\/plant_record_json>/)[1]);
   assert.deepEqual(c1Facts.sensors, { humidity: '62%', light: '850 lux' });
 
   await chatApp.call('POST', '/api/chat', { plantId: cp2.id, history });
-  const c2Sys = chatMock.calls[1].body.systemInstruction.parts[0].text;
-  const c2Facts = JSON.parse(c2Sys.split('\nThe user is asking about this saved plant:\n')[1]);
+  const c2Text = chatMock.calls[1].body.contents[0].parts[0].text;
+  const c2Facts = JSON.parse(c2Text.match(/<plant_record_json>\n([\s\S]*?)\n<\/plant_record_json>/)[1]);
   assert.equal('sensors' in c2Facts, false);
 });
 
@@ -1517,7 +1548,7 @@ test('per-plant blynkToken links via PATCH without leaking token and syncs live 
 
   const { call } = await start(t, { fetch: fakeFetch });
   const plant = (await call('POST', '/api/plants', { name: 'Balcony Mint' })).body;
-  assert.equal(plant.blynkLinked, undefined);
+  assert.equal(plant.blynkLinked, false);
 
   const linked = await call('PATCH', `/api/plants/${plant.id}`, { blynkToken: 'user-blynk-secret' });
   assert.equal(linked.status, 200);
@@ -1563,6 +1594,216 @@ test('POST /api/plants/:id/sensors accepts ESP32 payloads and marks stale readin
   for (const key of Object.keys(SENSOR_UNITS)) {
     assert.equal(after.sensors[key].connected, false);
   }
+});
+
+// ---------- security hardening regression tests ----------
+
+test('security headers, strict CSP, case-insensitive Cache-Control, and zero inline styles/innerHTML', async (t) => {
+  const { call } = await start(t, { mock: true, localAuth: true, secureCookies: true, publicOrigin: 'https://watermi.example.com' });
+  const headers = { origin: 'https://watermi.example.com', 'x-forwarded-proto': 'https' };
+
+  const home = await call('GET', '/', undefined, headers);
+  assert.equal(home.headers.get('x-powered-by'), null);
+  assert.equal(home.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(home.headers.get('x-frame-options'), 'DENY');
+  assert.equal(home.headers.get('referrer-policy'), 'no-referrer');
+  assert.match(home.headers.get('strict-transport-security'), /max-age=31536000/);
+  assert.match(home.headers.get('content-security-policy'), /script-src 'self'/);
+  assert.match(home.headers.get('content-security-policy'), /style-src 'self'/);
+
+  // Uppercase path variants must still receive Cache-Control: no-store
+  const upperCfg = await call('GET', '/API/config', undefined, headers);
+  assert.equal(upperCfg.status, 200);
+  assert.equal(upperCfg.headers.get('cache-control'), 'no-store');
+  assert.equal('hasKey' in upperCfg.body, false);
+  assert.equal(upperCfg.body.authEnabled, true);
+
+  // Unauthenticated /arduino access must be blocked when auth is enabled
+  assert.equal((await call('GET', '/arduino/watermi_blynk/watermi_blynk.ino', undefined, headers)).status, 401);
+
+  // Served HTML pages have zero inline style= attributes and zero external Google Fonts links
+  for (const p of ['/', '/register', '/auth/callback']) {
+    const page = await call('GET', p, undefined, headers);
+    assert.doesNotMatch(page.body, /\sstyle=/i, `${p} must not contain inline style attributes`);
+    assert.doesNotMatch(page.body, /fonts\.googleapis\.com/i, `${p} must not load external Google Fonts`);
+  }
+  const appJs = await call('GET', '/app.js', undefined, headers);
+  assert.doesNotMatch(appJs.body, /\.innerHTML\s*=/, 'app.js must not assign innerHTML');
+});
+
+test('CSRF origin checks reject cross-origin mutating requests and rate limiter enforces 429', async (t) => {
+  const origin = 'https://watermi.example.com';
+  const { call } = await start(t, {
+    mock: true,
+    localAuth: true,
+    publicOrigin: origin,
+    rateLimits: { authMax: 3, authWindowMs: 60_000 },
+  });
+  const goodHeaders = { origin };
+  const creds = { email: 'csrf@example.com', password: 'password-1234' };
+  const reg = await call('POST', '/api/auth/register', creds, goodHeaders);
+  assert.equal(reg.status, 201);
+  const cookie = reg.headers.get('set-cookie').split(';')[0];
+
+  // Cross-origin POST /api/plants must be rejected with 403
+  const badOrigin = await call('POST', '/api/plants', { name: 'Injected' }, { cookie, origin: 'https://evil.example' });
+  assert.equal(badOrigin.status, 403);
+  assert.equal(badOrigin.body.code, 'invalid_origin');
+
+  // Sec-Fetch-Site: cross-site must be rejected even without Origin
+  const badFetch = await call('POST', '/api/plants', { name: 'Injected' }, { cookie, 'sec-fetch-site': 'cross-site' });
+  assert.equal(badFetch.status, 403);
+
+  // Auth rate limiter kicks in after authMax (1 register + 2 logins = 3, 4th -> 429)
+  await call('POST', '/api/auth/login', creds, goodHeaders);
+  await call('POST', '/api/auth/login', creds, goodHeaders);
+  const limited = await call('POST', '/api/auth/login', creds, goodHeaders);
+  assert.equal(limited.status, 429);
+  assert.equal(limited.body.code, 'rate_limited');
+  assert.ok(Number(limited.headers.get('retry-after')) >= 1);
+});
+
+test('SSRF protection blocks non-blynk.cloud servers and blynkToken is encrypted at rest', async (t) => {
+  const fakeFetch = async (url) => {
+    const u = String(url);
+    assert.ok(u.startsWith('https://sgp1.blynk.cloud/external/api/'));
+    assert.ok(u.includes('my-secret-device-tok'));
+    if (u.includes('isHardwareConnected')) return new Response('true');
+    return Response.json({ v0: 25, v1: 60, v2: 500, v3: 55 });
+  };
+  const { call, dataDir } = await start(t, { fetch: fakeFetch, sessionSecret: 'a-very-strong-test-secret-0123456789' });
+  const plant = (await call('POST', '/api/plants', { name: 'Orchid' })).body;
+
+  for (const badServer of ['https://127.0.0.1', 'https://169.254.169.254', 'https://evil.example', 'http://blynk.cloud']) {
+    const res = await call('PATCH', `/api/plants/${plant.id}`, { blynkServer: badServer });
+    assert.equal(res.status, 400);
+    assert.throws(() => validateBlynkServer(badServer));
+  }
+
+  const ok = await call('PATCH', `/api/plants/${plant.id}`, {
+    blynkToken: 'my-secret-device-tok',
+    blynkServer: 'https://sgp1.blynk.cloud',
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.blynkLinked, true);
+  assert.equal(ok.body.sensors.temperature.value, 25);
+
+  // Stored db.json must contain encrypted token, never plaintext
+  const rawDb = readFileSync(join(dataDir, 'db.json'), 'utf8');
+  assert.doesNotMatch(rawDb, /my-secret-device-tok/);
+  assert.match(rawDb, /enc:v1:/);
+});
+
+test('image magic-byte validation rejects fake WebP/PNG, sensor bounds reject impossible values, and webhook rejects query ?key=', async (t) => {
+  const { call } = await start(t, { sensorKey: 'super-secret-sensor-key' });
+  const plant = (await call('POST', '/api/plants', { name: 'Pepper' })).body;
+
+  // Fake WebP: RIFF header with WAVE instead of WEBP at bytes 8..11
+  const fakeWav = `data:image/webp;base64,${Buffer.from('RIFF\x24\x00\x00\x00WAVEfmt ', 'binary').toString('base64')}`;
+  assert.equal((await call('POST', '/api/analyze', { image: fakeWav })).status, 400);
+
+  // Truncated PNG (first 4 bytes only, invalid 8-byte header)
+  const fakePng = `data:image/png;base64,${Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x00, 0x00, 0x00]).toString('base64')}`;
+  assert.equal((await call('POST', '/api/analyze', { image: fakePng })).status, 400);
+
+  // Impossible sensor values are rejected to null
+  const bounded = normalizeSensors({
+    temperature: { connected: true, value: 9999 },
+    humidity: { connected: true, value: -25 },
+    soilMoisture: { connected: true, value: 150 },
+    light: { connected: true, value: -10 },
+  });
+  assert.equal(bounded.temperature.value, null);
+  assert.equal(bounded.humidity.value, null);
+  assert.equal(bounded.soilMoisture.value, null);
+  assert.equal(bounded.light.value, null);
+
+  // Webhook must reject ?key= query string and accept header x-sensor-key only
+  assert.equal((await call('POST', '/api/webhook/blynk?key=super-secret-sensor-key', { pin: 'V0', value: 24 })).status, 401);
+  assert.equal((await call('POST', '/api/webhook/blynk', { pin: 'V0', value: 24, plantId: 'nonexistent' }, { 'x-sensor-key': 'super-secret-sensor-key' })).status, 404);
+  assert.equal((await call('POST', '/api/webhook/blynk', { pin: 'V0', value: 24, plantId: plant.id }, { 'x-sensor-key': 'super-secret-sensor-key' })).status, 200);
+});
+
+test('AI analysis enforces maxOutputTokens, non-plant cleanup, and deterministic safety disclaimer', async (t) => {
+  const { fake, calls } = fakeGemini(() => Response.json(reply(JSON.stringify({
+    is_plant: false,
+    health_score: 95,
+    status: 'healthy',
+    summary: 'This is a tractor.',
+    problems: [{ name: 'Fake', severity: 'high', evidence: 'x', likely_cause: 'y' }],
+    actions: ['Spray pesticide'],
+    prevention: ['None'],
+  }))));
+  const { call } = await start(t, { apiKey: 'k', fetch: fake });
+  const res = await call('POST', '/api/analyze', { image: IMAGE });
+  assert.equal(res.status, 200);
+  assert.equal(calls[0].body.generationConfig.maxOutputTokens, 1024);
+  assert.equal(res.body.is_plant, false);
+  assert.equal(res.body.health_score, 0);
+  assert.deepEqual(res.body.problems, []);
+  assert.deepEqual(res.body.actions, []);
+  assert.equal(res.body.disclaimer, AI_DISCLAIMER);
+});
+
+test('hardened Blynk firmware uses TLS, watchdog, unconditional Blynk.config, and sketch generator blocks C++ injection and invalid pins', async (t) => {
+  const { call, base } = await start(t, { mock: true });
+  const sketch = await call('GET', '/arduino/watermi_blynk/watermi_blynk.ino');
+  assert.equal(sketch.status, 200);
+  assert.match(sketch.body, /#include <BlynkSimpleEsp32_SSL\.h>/);
+  assert.match(sketch.body, /#include <esp_task_wdt\.h>/);
+  assert.doesNotMatch(sketch.body, /TMPL61Th4g3sH/);
+  assert.doesNotMatch(sketch.body, /setInsecure/);
+  assert.match(sketch.body, /if \(SOIL_DRY_RAW != SOIL_WET_RAW\)/);
+
+  // Legacy insecure watermi_esp32.ino is removed
+  assert.equal((await call('GET', '/arduino/watermi_esp32/watermi_esp32.ino')).status, 404);
+
+  // Verify frontend sketch validation blocks C++ newline injection, equal dry/wet raw, and duplicate pins
+  const html = (await call('GET', '/')).body;
+  const appJs = (await call('GET', '/app.js')).body;
+  const { document } = createDom(html);
+  const sandbox = {
+    document,
+    window: { addEventListener() {}, scrollTo() {}, isSecureContext: true },
+    history: { replaceState() {} },
+    location: { hash: '#setup' },
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    ResizeObserver: class { observe() {} },
+    Event: class { constructor(type) { this.type = type; } },
+    Blob: class { constructor(parts) { this.text = parts.join(''); } },
+    fetch: (url, init) => globalThis.fetch(url.startsWith('/') ? base + url : url, init),
+    confirm: () => true,
+    setTimeout,
+    clearTimeout,
+    console,
+    URL: { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} },
+    TextDecoder,
+  };
+  vm.runInNewContext(appJs, sandbox);
+  const downloadBtn = document.querySelector('#s-download');
+  const dhtSel = document.querySelector('#s-dhtpin');
+  for (let i = 0; i < 100 && dhtSel.children.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+
+  // Newline injection attempt in template ID disables download
+  document.querySelector('#s-ssid').value = 'FarmNet';
+  document.querySelector('#s-blynk-auth').value = 'VALID_TOKEN_123456';
+  document.querySelector('#s-blynk-template').value = 'TMPL_1\n#error pwned';
+  document.querySelector('#s-blynk-template').dispatchEvent({ type: 'input' });
+  assert.equal(downloadBtn.disabled, true);
+
+  // Valid inputs but equal SOIL_DRY_RAW === SOIL_WET_RAW disables download
+  document.querySelector('#s-blynk-template').value = 'TMPL_VALID_123';
+  document.querySelector('#s-dry').value = '2000';
+  document.querySelector('#s-wet').value = '2000';
+  document.querySelector('#s-wet').dispatchEvent({ type: 'input' });
+  assert.equal(downloadBtn.disabled, true);
+
+  // Fix dry/wet, duplicate soil and light pins disables download
+  document.querySelector('#s-wet').value = '500';
+  document.querySelector('#s-soilpin').value = '34';
+  document.querySelector('#s-lightpin').value = '34';
+  document.querySelector('#s-lightpin').dispatchEvent({ type: 'input' });
+  assert.equal(downloadBtn.disabled, true);
 });
 
 

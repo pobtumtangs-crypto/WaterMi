@@ -15,7 +15,7 @@ async function handleLogin(event) {
   try {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-requested-with': 'fetch' },
       body: JSON.stringify({ email, password }),
       credentials: 'include',
     });

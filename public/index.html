@@ -6,11 +6,9 @@
   <meta name="theme-color" content="#1f4d3a">
   <title>WaterMI</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%231f4d3a'/%3E%3Cpath d='M6 18C5 10 10 6 19 6c0 9-5 14-13 12zm0 0 8-8' fill='none' stroke='%23b5e26b' stroke-width='1.8'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&display=swap">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <!-- Login view (shown when not authenticated) -->
   <header class="topbar" id="app-header">
     <div class="brand">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19C4 10 10 4 20 4c0 10-6 16-15 15z"/><path d="M5 19l9-9"/></svg>
@@ -23,7 +21,10 @@
       <button type="button" data-view="chat">Chat</button>
       <button type="button" data-view="setup">Sensors</button>
     </nav>
-    <button type="button" id="logout-btn" hidden class="btn quiet" style="margin-left: auto;">Logout</button>
+    <div class="topbar-actions">
+      <span id="user-label" class="user-label muted small" hidden></span>
+      <button type="button" id="logout-btn" hidden class="btn quiet">Logout</button>
+    </div>
   </header>
 
   <div id="banner" role="alert" hidden></div>
@@ -66,14 +67,15 @@
         <select id="chat-plant" aria-label="Chat about"></select>
         <button type="button" id="chat-clear" class="btn quiet">Clear chat</button>
       </div>
-      <div id="msgs" aria-live="polite"></div>
+      <div id="msgs"></div>
       <div id="chips"></div>
       <form id="composer">
-        <textarea id="chat-input" rows="1" maxlength="8000" aria-label="Message" placeholder="Ask about your plant..."></textarea>
+        <textarea id="chat-input" rows="1" maxlength="2000" aria-label="Message" placeholder="Ask about your plant..."></textarea>
         <button type="submit" id="chat-send" class="btn primary" aria-label="Send">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16M13 5l7 7-7 7"/></svg>
         </button>
       </form>
+      <p class="muted small disclaimer-note">AI suggestions are not a confirmed diagnosis. Verify plant conditions and follow product labels before applying treatments.</p>
     </section>
 
     <section id="view-setup" class="view" aria-labelledby="h-setup">
@@ -98,13 +100,13 @@
           <li class="step">
             <span class="step-num">3</span>
             <div class="step-content">
-              <strong>Configure & download</strong> — Enter Wi-Fi (2.4 GHz only), your Blynk Template ID & Auth Token, choose your GPIO pins, click <strong>Download sketch</strong>.
+              <strong>Configure &amp; download</strong> — Enter Wi-Fi (2.4 GHz only), your Blynk Template ID &amp; Auth Token, choose your GPIO pins, click <strong>Download sketch</strong>.
             </div>
           </li>
           <li class="step">
             <span class="step-num">4</span>
             <div class="step-content">
-              <strong>Flash to ESP32</strong> — Open the downloaded <code>watermi_blynk.ino</code> in Arduino IDE. Install <strong>Blynk</strong> library (Sketch → Include Library → Manage Libraries → search "Blynk"). Select board & port. Click <strong>Upload</strong>. Open Serial Monitor at 115200 baud — you should see "Wi-Fi connected!" and Blynk connection.
+              <strong>Flash to ESP32</strong> — Open the downloaded <code>watermi_blynk.ino</code> in Arduino IDE. Install <strong>Blynk</strong> library (Sketch → Include Library → Manage Libraries → search "Blynk"). Select board &amp; port. Click <strong>Upload</strong>. Open Serial Monitor at 115200 baud — you should see encrypted TLS connection status.
             </div>
           </li>
           <li class="step">
@@ -162,29 +164,29 @@
         </div>
         <div class="field">
           <label for="s-blynk-template">Blynk Template ID</label>
-          <input id="s-blynk-template" autocomplete="off" value="TMPL61Th4g3sH" placeholder="TMPL61Th4g3sH">
+          <input id="s-blynk-template" autocomplete="off" value="" placeholder="TMPLxxxxxxxx">
         </div>
         <div class="field">
           <label for="s-blynk-auth">Blynk Auth Token</label>
           <input id="s-blynk-auth" type="password" autocomplete="off" placeholder="Paste your device Auth Token from Blynk">
         </div>
-        <div class="row" style="margin-top:8px;">
+        <div class="row mt-8">
           <button type="button" id="s-connect" class="btn primary" disabled>Connect Blynk to plant</button>
           <button type="button" id="s-disconnect" class="btn quiet" hidden>Disconnect Blynk</button>
         </div>
-        <p id="connect-hint" class="muted small" style="margin-top:6px;">Paste your Blynk Auth Token and click Connect so WaterMI reads live data automatically.</p>
+        <p id="connect-hint" class="muted small mt-6">Paste your Blynk Auth Token and click Connect so WaterMI reads live data automatically.</p>
 
-        <h3 style="margin:20px 0 8px;">Wi-Fi (for ESP32 sketch)</h3>
+        <h3 class="setup-subhead">Wi-Fi (for ESP32 sketch)</h3>
         <div class="field">
           <label for="s-ssid">Wi-Fi name (2.4 GHz)</label>
           <input id="s-ssid" autocomplete="off" placeholder="MyHomeWifi">
         </div>
         <div class="field">
           <label for="s-pass">Wi-Fi password</label>
-          <input id="s-pass" type="password" autocomplete="off" placeholder="Never leaves your browser">
+          <input id="s-pass" type="password" autocomplete="off" placeholder="Embedded only in the downloaded .ino file">
         </div>
 
-        <h3 style="margin:16px 0 8px;">Pin assignments</h3>
+        <h3 class="setup-subhead">Pin assignments</h3>
         <div class="field">
           <label for="s-dhtpin">DHT22 data pin</label>
           <select id="s-dhtpin"></select>
@@ -208,9 +210,9 @@
           </select>
         </div>
 
-        <details style="margin-top:12px;">
+        <details class="mt-12">
           <summary>Advanced options</summary>
-          <div class="field" style="margin-top:8px;">
+          <div class="field mt-8">
             <label for="s-interval">Send interval (ms)</label>
             <input id="s-interval" type="number" min="1000" step="500" value="2000" placeholder="2000">
             <p class="muted small">How often to send to Blynk (min 1000ms)</p>
@@ -226,25 +228,25 @@
             <p class="muted small">Measure in water, then adjust</p>
           </div>
         </details>
-        <button type="button" id="s-download" class="btn primary big" disabled>Download sketch</button>
-        <p id="download-hint" class="muted small" style="margin-top:8px;">Enter Wi-Fi, Blynk Template ID &amp; Auth Token, then click Download sketch.</p>
+        <button type="button" id="s-download" class="btn primary big mt-12" disabled>Download sketch</button>
+        <p id="download-hint" class="muted small mt-8">Enter Wi-Fi, Blynk Template ID &amp; Auth Token, then click Download sketch. Keep the downloaded .ino file private — it contains your Wi-Fi password and Blynk token.</p>
       </section>
 
-      <section class="card" aria-live="polite">
+      <section class="card">
         <h2>Live check</h2>
         <p id="live-msg" class="muted">Choose a plant above to check live sensor readings.</p>
-        <div id="live" class="sensor-grid" style="margin-top:12px;"></div>
+        <div id="live" class="sensor-grid mt-12"></div>
       </section>
 
       <details class="card">
         <summary>Troubleshooting</summary>
-        <ul style="margin:12px 0 0 18px;line-height:1.8;font-size:15px;">
-          <li><strong>ESP32 won't connect to Wi-Fi:</strong> Check 2.4 GHz network name & password</li>
-          <li><strong>"Invalid Auth Token" in Serial Monitor:</strong> Re-check Template ID & Auth Token from Blynk Console</li>
+        <ul class="troubleshoot-list">
+          <li><strong>ESP32 won't connect to Wi-Fi:</strong> Check 2.4 GHz network name &amp; password</li>
+          <li><strong>"Invalid Auth Token" in Serial Monitor:</strong> Re-check Template ID &amp; Auth Token from Blynk Console</li>
           <li><strong>Blynk shows "Device offline":</strong> Check Wi-Fi, restart ESP32, verify Auth Token matches device</li>
-          <li><strong>Temp/humidity shows NaN:</strong> Check DHT22 wiring on selected GPIO + 10 kΩ pull-up resistor</li>
+          <li><strong>Temp/humidity shows ERR:</strong> Check DHT22 wiring on selected GPIO + 10 kΩ pull-up resistor</li>
           <li><strong>Soil moisture stuck at 0% or 100%:</strong> Calibrate SOIL_DRY_RAW / SOIL_WET_RAW in Advanced options</li>
-          <li><strong>All sensors drop after ~30s:</strong> Board stopped — check power supply & Wi-Fi stability</li>
+          <li><strong>All sensors drop after ~30s:</strong> Board stopped — check power supply &amp; Wi-Fi stability</li>
         </ul>
       </details>
     </section>

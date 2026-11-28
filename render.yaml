@@ -7,13 +7,13 @@ services:
     envVars:
       - key: HOST
         value: 0.0.0.0
-      - key: DATA_DIR
-        value: /data
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY
         sync: false
       - key: SESSION_SECRET
+        generateValue: true
+      - key: DATA_ENCRYPTION_KEY
         generateValue: true
       - key: GEMINI_API_KEY
         sync: false

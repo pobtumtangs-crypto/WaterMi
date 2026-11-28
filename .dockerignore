@@ -1,5 +1,10 @@
-node_modules
-.env
-data
-test
-.git
+# Deny-by-default build context allowlist
+*
+!package.json
+!package-lock.json
+!server.js
+!plantnet.js
+!groq.js
+!supabase.js
+!public/**
+!arduino/watermi_blynk/watermi_blynk.ino

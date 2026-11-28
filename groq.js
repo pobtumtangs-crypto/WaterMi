@@ -36,7 +36,7 @@ export async function groqAnalysis({ fetch, key, model }, { system, context, ima
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
       body: JSON.stringify({
         model,
-        reasoning_effort: 'none',
+        ...(/qwen/i.test(model) && { reasoning_effort: 'none' }),
         max_completion_tokens: MAX_REPLY_TOKENS,
         response_format: {
           type: 'json_schema',

@@ -30,13 +30,13 @@ async function handleRegister(event) {
       throw new Error('Passwords do not match');
     }
 
-    if (password.length < 6) {
-      throw new Error('Password must be at least 6 characters');
+    if (password.length < 8) {
+      throw new Error('Password must be at least 8 characters');
     }
 
     const res = await fetch('/api/auth/register', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'x-requested-with': 'fetch' },
       body: JSON.stringify({ name, email, password }),
       credentials: 'include',
     });
@@ -64,5 +64,5 @@ async function handleRegister(event) {
 
 // Initialize
 $('#register-form').addEventListener('submit', handleRegister);
-// Focus email field on load
-$('#register-email').focus();
+// Focus first field on load
+$('#register-name').focus();
