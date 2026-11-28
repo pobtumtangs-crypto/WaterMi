@@ -939,7 +939,10 @@ async function init() {
 async function loadSetupSketch() {
   try {
     const res = await fetch('/arduino/watermi_blynk/watermi_blynk.ino');
-    if (res.ok) setupSketch = await res.text();
+    if (res.ok) {
+      setupSketch = await res.text();
+      refreshSetupForm();
+    }
   } catch {
     // The download button stays disabled without the sketch.
   }
@@ -947,35 +950,35 @@ async function loadSetupSketch() {
 
 function setConst(source, name, value) {
   return source.replace(
-    new RegExp(`(const char\\* ${name}\\s*=\\s*)"[^"]*";`),
+    new RegExp(`(const\\s+char\\*\\s+${name}\\s*=\\s*)"[^"]*";`),
     (_, head) => `${head}"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}";`,
   );
 }
 
 function setStringDefine(source, name, value) {
   return source.replace(
-    new RegExp(`(#define ${name}\\s+)"[^"]*"`),
+    new RegExp(`(#define\\s+${name}\\s+)"[^"]*"`),
     (_, head) => `${head}"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
   );
 }
 
 function setDefine(source, name, value) {
   return source.replace(
-    new RegExp(`(#define ${name}\\s+)\\d+`),
+    new RegExp(`(#define\\s+${name}\\s+)\\d+`),
     (_, head) => `${head}${value}`,
   );
 }
 
 function setIntConst(source, name, value) {
   return source.replace(
-    new RegExp(`(const (?:unsigned long|int) ${name}\\s*=\\s*)\\d+`),
+    new RegExp(`(const\\s+(?:unsigned long|int)\\s+${name}\\s*=\\s*)\\d+`),
     (_, head) => `${head}${value}`,
   );
 }
 
 function setBoolConst(source, name, value) {
   return source.replace(
-    new RegExp(`(const bool ${name}\\s*=\\s*)(true|false)`),
+    new RegExp(`(const\\s+bool\\s+${name}\\s*=\\s*)(true|false)`),
     (_, head) => `${head}${value}`,
   );
 }
@@ -989,7 +992,7 @@ function setupValues() {
     SEND_INTERVAL_MS: $('#s-interval').value,
     SOIL_DRY_RAW: $('#s-dry').value,
     SOIL_WET_RAW: $('#s-wet').value,
-    LIGHT_SENSOR_ENABLED: $('#s-light').value,
+    LIGHT_SENSOR_ENABLED: $('#s-light').value === 'false' ? 'false' : 'true',
     DHTPIN: $('#s-dhtpin').value,
     soilMoisturePin: $('#s-soilpin').value,
     lightPin: $('#s-lightpin').value,
@@ -1151,6 +1154,7 @@ function populatePinDropdowns() {
       if (n === defaultVal) opt.selected = true;
       return opt;
     }));
+    sel.value = String(defaultVal);
   }
 
   fillSelect('#s-dhtpin', dhtPins, 4);

@@ -1367,6 +1367,77 @@ test('setup view and Blynk sketch are served with every configurable setting', a
   for (const name of ['WIFI_SSID', 'WIFI_PASSWORD']) {
     assert.match(sketch.body, new RegExp(`const char\\* ${name}\\s*=\\s*"[^"]*";`), `${name} missing from Blynk sketch`);
   }
+  assert.match(sketch.body, /#include <DHT\.h>/);
+  assert.match(sketch.body, /const bool LIGHT_SENSOR_ENABLED = true;/);
+  assert.match(sketch.body, /#define VPIN_TEMPERATURE V0/);
+  assert.match(sketch.body, /#define VPIN_HUMIDITY\s+V1/);
+  assert.match(sketch.body, /#define VPIN_LIGHT\s+V2/);
+  assert.match(sketch.body, /#define VPIN_SOIL\s+V3/);
+  assert.match(sketch.body, /lightRaw = constrain\(lightRaw, 0, 4095\);/);
+  assert.match(sketch.body, /Blynk\.config\(BLYNK_AUTH_TOKEN\);/);
+});
+
+test('setup sketch download injects user template ID, auth token, Wi-Fi, and GPIO pins including lightPin', async (t) => {
+  const { call, base } = await start(t, { mock: true });
+  const html = (await call('GET', '/')).body;
+  const appJs = (await call('GET', '/app.js')).body;
+  const { document } = createDom(html);
+  const downloaded = [];
+  const sandbox = {
+    document,
+    window: { addEventListener() {}, scrollTo() {} },
+    history: { replaceState() {} },
+    location: { hash: '#setup' },
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    ResizeObserver: class { observe() {} },
+    Event: class { constructor(type) { this.type = type; } },
+    Blob: class { constructor(parts) { this.text = parts.join(''); } },
+    fetch: (url, init) => globalThis.fetch(url.startsWith('/') ? base + url : url, init),
+    confirm: () => true,
+    setTimeout,
+    clearTimeout,
+    console,
+    URL: {
+      createObjectURL: (blob) => { downloaded.push(blob.text); return 'blob:sketch'; },
+      revokeObjectURL: () => {},
+    },
+    TextDecoder,
+  };
+  vm.runInNewContext(appJs, sandbox);
+
+  const dhtSel = document.querySelector('#s-dhtpin');
+  const soilSel = document.querySelector('#s-soilpin');
+  const lightSel = document.querySelector('#s-lightpin');
+  const downloadBtn = document.querySelector('#s-download');
+  for (let i = 0; i < 100 && dhtSel.children.length === 0; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+
+  document.querySelector('#s-blynk-template').value = 'TMPL_USER_123';
+  document.querySelector('#s-blynk-auth').value = 'AUTH_USER_456';
+  document.querySelector('#s-ssid').value = 'GrowerNet';
+  document.querySelector('#s-pass').value = 'supersecret';
+  dhtSel.value = '14';
+  soilSel.value = '32';
+  lightSel.value = '33';
+  for (const id of ['#s-blynk-template', '#s-blynk-auth', '#s-ssid', '#s-pass', '#s-dhtpin', '#s-soilpin', '#s-lightpin']) {
+    document.querySelector(id).dispatchEvent({ type: 'input' });
+  }
+  for (let i = 0; i < 100 && downloadBtn.disabled; i++) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.equal(downloadBtn.disabled, false);
+
+  downloadBtn.click();
+  const out = downloaded.at(-1);
+  assert.match(out, /#define BLYNK_TEMPLATE_ID "TMPL_USER_123"/);
+  assert.match(out, /#define BLYNK_AUTH_TOKEN "AUTH_USER_456"/);
+  assert.match(out, /const char\* WIFI_SSID\s*=\s*"GrowerNet";/);
+  assert.match(out, /const char\* WIFI_PASSWORD\s*=\s*"supersecret";/);
+  assert.match(out, /#define DHTPIN\s+14\b/);
+  assert.match(out, /const int soilMoisturePin = 32;/);
+  assert.match(out, /const bool LIGHT_SENSOR_ENABLED = true;/);
+  assert.match(out, /const int\s+lightPin\s*=\s*33;/);
 });
 
 test('Blynk webhook supports batch and partial virtual-pin updates without wiping other sensors', async (t) => {

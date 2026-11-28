@@ -11,7 +11,7 @@ Send live **humidity**, **temperature**, **soil moisture** and optional **light*
 5. **Watch live data in Blynk** — Open the Blynk app (mobile or web). Add Gauge/Value Display widgets for:
    - **V0** = Temperature (°C)
    - **V1** = Humidity (%)
-   - **V2** = Light (lux)
+   - **V2** = Ambient Light (0–4095)
    - **V3** = Soil Moisture (%)
    Data appears every 2 seconds.
 
@@ -64,7 +64,7 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 #define DHTPIN  4               // DHT22 data pin
 #define DHTTYPE DHT22
 const int soilMoisturePin = 34; // Soil moisture AO pin
-const bool LIGHT_SENSOR_ENABLED = false;  // Set to true to enable light sensor
+const bool LIGHT_SENSOR_ENABLED = true;   // Set to false to disable light sensor
 const int  lightPin             = 35;     // Light sensor AO pin
 
 // Soil calibration (adjust based on your sensor)
@@ -97,7 +97,7 @@ In Blynk Console or mobile app, add **Value Display** or **Gauge** widgets:
 | --- | --- | --- | --- |
 | V0 | Temperature | °C | -40–80 |
 | V1 | Humidity | % | 0–100 |
-| V2 | Light | lux | 0–20000 |
+| V2 | Ambient Light | raw | 0–4095 |
 | V3 | Soil Moisture | % | 0–100 |
 
 Set reading rate to "Push" (not Poll) since the ESP32 pushes data.

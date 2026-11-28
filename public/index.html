@@ -136,10 +136,12 @@
               <span class="pin"><span class="label">GND</span> → <span class="value">GND</span></span>
             </span>
           </div>
-          <div class="sensor-row optional">
-            <span class="sensor-name">Light (optional)</span>
+          <div class="sensor-row">
+            <span class="sensor-name">Light sensor</span>
             <span class="sensor-pins">
+              <span class="pin"><span class="label">VCC</span> → <span class="value">3.3V</span></span>
               <span class="pin"><span class="label">AO</span> → <span class="value" id="w-lightpin">GPIO 35</span></span>
+              <span class="pin"><span class="label">GND</span> → <span class="value">GND</span></span>
             </span>
           </div>
           <p class="wiring-notes">
@@ -201,8 +203,8 @@
         <div class="field">
           <label for="s-light">Enable light sensor</label>
           <select id="s-light">
+            <option value="true" selected>Yes</option>
             <option value="false">No</option>
-            <option value="true">Yes</option>
           </select>
         </div>
 
