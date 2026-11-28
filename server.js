@@ -842,7 +842,7 @@ export function createApp({
     return { ...safePlant, blynkLinked: Boolean(savedToken || usesEnvBlynk), sensors };
   };
 
-  const BLYNK_PINS = { v0: 'humidity', v1: 'temperature', v2: 'soilMoisture', v3: 'light' };
+  const BLYNK_PINS = { v0: 'temperature', v1: 'humidity', v2: 'light', v3: 'soilMoisture' };
   const lastBlynkSyncByPlant = new Map();
 
   async function syncPlantFromBlynk(plant, { force = false, save = () => store?.save() } = {}) {

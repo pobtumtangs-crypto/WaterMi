@@ -9,10 +9,10 @@ Send live **humidity**, **temperature**, **soil moisture** and optional **light*
 3. **Configure & download** — Enter Wi-Fi (2.4 GHz only), your Blynk Template ID & Auth Token, choose your GPIO pins in the dropdowns, click **Download sketch**.
 4. **Flash to ESP32** — Open the downloaded `watermi_blynk.ino` in Arduino IDE. Install **Blynk** library (Sketch → Include Library → Manage Libraries → search "Blynk"). Select board & port. Click **Upload**. Open Serial Monitor at 115200 baud — you should see "Wi-Fi connected!" and Blynk connection.
 5. **Watch live data in Blynk** — Open the Blynk app (mobile or web). Add Gauge/Value Display widgets for:
-   - **V0** = Humidity (%)
-   - **V1** = Temperature (°C)
-   - **V2** = Soil Moisture (%)
-   - **V3** = Light (lux)
+   - **V0** = Temperature (°C)
+   - **V1** = Humidity (%)
+   - **V2** = Light (lux)
+   - **V3** = Soil Moisture (%)
    Data appears every 2 seconds.
 
 ## What you need
@@ -75,10 +75,10 @@ const int SOIL_WET_RAW = 0;      // Raw value in water
 const unsigned long SEND_INTERVAL_MS = 2000;
 
 // Blynk virtual pins (match widgets in Blynk app)
-#define VPIN_HUMIDITY     V0
-#define VPIN_TEMPERATURE  V1
-#define VPIN_SOIL         V2
-#define VPIN_LIGHT        V3
+#define VPIN_TEMPERATURE  V0
+#define VPIN_HUMIDITY     V1
+#define VPIN_LIGHT        V2
+#define VPIN_SOIL         V3
 ```
 
 ### Customization Options
@@ -95,10 +95,10 @@ In Blynk Console or mobile app, add **Value Display** or **Gauge** widgets:
 
 | Virtual Pin | Label | Unit | Range |
 | --- | --- | --- | --- |
-| V0 | Humidity | % | 0–100 |
-| V1 | Temperature | °C | -40–80 |
-| V2 | Soil Moisture | % | 0–100 |
-| V3 | Light | lux | 0–20000 |
+| V0 | Temperature | °C | -40–80 |
+| V1 | Humidity | % | 0–100 |
+| V2 | Light | lux | 0–20000 |
+| V3 | Soil Moisture | % | 0–100 |
 
 Set reading rate to "Push" (not Poll) since the ESP32 pushes data.
 

@@ -37,14 +37,14 @@ const int SOIL_WET_RAW = 0;     // Raw value in wet conditions
 const unsigned long SEND_INTERVAL_MS = 2000;
 
 // Virtual pins on Blynk (match these in your Blynk template)
-// V0 = Humidity (%)
-// V1 = Temperature (°C)
-// V2 = Soil Moisture (%)
-// V3 = Light (lux)
-#define VPIN_HUMIDITY     V0
-#define VPIN_TEMPERATURE  V1
-#define VPIN_SOIL         V2
-#define VPIN_LIGHT        V3
+// V0 = Temperature (°C)
+// V1 = Humidity (%)
+// V2 = Light (lux)
+// V3 = Soil Moisture (%)
+#define VPIN_TEMPERATURE  V0
+#define VPIN_HUMIDITY     V1
+#define VPIN_LIGHT        V2
+#define VPIN_SOIL         V3
 
 DHT dht(DHTPIN, DHTTYPE);
 

@@ -1374,23 +1374,32 @@ test('Blynk webhook supports batch and partial virtual-pin updates without wipin
   const plant = (await call('POST', '/api/plants', { name: 'Blynk Tomato' })).body;
 
   const first = await call('POST', '/api/webhook/blynk', {
-    values: { V0: 65.4, V1: 28.2 },
+    values: { V0: 28.2, V1: 65.4 },
   });
   assert.equal(first.status, 200);
   assert.equal(first.body.id, plant.id);
-  assert.equal(first.body.sensors.humidity.connected, true);
-  assert.equal(first.body.sensors.humidity.value, 65.4);
   assert.equal(first.body.sensors.temperature.connected, true);
   assert.equal(first.body.sensors.temperature.value, 28.2);
+  assert.equal(first.body.sensors.humidity.connected, true);
+  assert.equal(first.body.sensors.humidity.value, 65.4);
+  assert.equal(first.body.sensors.light.connected, false);
   assert.equal(first.body.sensors.soilMoisture.connected, false);
 
   // Single-pin update should keep V0 and V1 intact
-  const second = await call('POST', '/api/webhook/blynk', { pin: 'V2', value: '52' });
+  const second = await call('POST', '/api/webhook/blynk', { pin: 'V2', value: '1201' });
   assert.equal(second.status, 200);
+  assert.equal(second.body.sensors.temperature.connected, true);
+  assert.equal(second.body.sensors.temperature.value, 28.2);
   assert.equal(second.body.sensors.humidity.connected, true);
   assert.equal(second.body.sensors.humidity.value, 65.4);
-  assert.equal(second.body.sensors.soilMoisture.connected, true);
-  assert.equal(second.body.sensors.soilMoisture.value, 52);
+  assert.equal(second.body.sensors.light.connected, true);
+  assert.equal(second.body.sensors.light.value, 1201);
+
+  const third = await call('POST', '/api/webhook/blynk', { pin: 'V3', value: '52' });
+  assert.equal(third.status, 200);
+  assert.equal(third.body.sensors.soilMoisture.connected, true);
+  assert.equal(third.body.sensors.soilMoisture.value, 52);
+  assert.equal(third.body.sensors.light.value, 1201);
 });
 
 test('BLYNK_AUTH_TOKEN automatically syncs live sensor values and hardware online status', async (t) => {
@@ -1401,7 +1410,7 @@ test('BLYNK_AUTH_TOKEN automatically syncs live sensor values and hardware onlin
       return new Response(online ? 'true' : 'false', { status: 200 });
     }
     if (u.includes('/external/api/get')) {
-      return Response.json({ v0: 71.24, v1: 26.8, v2: 44, v3: 12000 });
+      return Response.json({ v0: 26.8, v1: 71.24, v2: 12000, v3: 44 });
     }
     throw new Error(`Unexpected fetch: ${u}`);
   };
@@ -1412,14 +1421,14 @@ test('BLYNK_AUTH_TOKEN automatically syncs live sensor values and hardware onlin
   const list = await call('GET', '/api/plants');
   assert.equal(list.status, 200);
   const synced = list.body.find((p) => p.id === plant.id);
-  assert.equal(synced.sensors.humidity.connected, true);
-  assert.equal(synced.sensors.humidity.value, 71.2);
   assert.equal(synced.sensors.temperature.connected, true);
   assert.equal(synced.sensors.temperature.value, 26.8);
-  assert.equal(synced.sensors.soilMoisture.connected, true);
-  assert.equal(synced.sensors.soilMoisture.value, 44);
+  assert.equal(synced.sensors.humidity.connected, true);
+  assert.equal(synced.sensors.humidity.value, 71.2);
   assert.equal(synced.sensors.light.connected, true);
   assert.equal(synced.sensors.light.value, 12000);
+  assert.equal(synced.sensors.soilMoisture.connected, true);
+  assert.equal(synced.sensors.soilMoisture.value, 44);
 });
 
 test('per-plant blynkToken links via PATCH without leaking token and syncs live readings', async (t) => {
@@ -1429,7 +1438,7 @@ test('per-plant blynkToken links via PATCH without leaking token and syncs live 
       return new Response('true', { status: 200 });
     }
     if (u.includes('/external/api/get') && u.includes('user-blynk-secret')) {
-      return Response.json({ v0: 58.6, v1: 25.1, v2: 61, v3: 0 });
+      return Response.json({ v0: 25.1, v1: 58.6, v2: 1201, v3: 61 });
     }
     throw new Error(`Unexpected fetch: ${u}`);
   };
@@ -1442,9 +1451,11 @@ test('per-plant blynkToken links via PATCH without leaking token and syncs live 
   assert.equal(linked.status, 200);
   assert.equal(linked.body.blynkLinked, true);
   assert.equal('blynkToken' in linked.body, false);
+  assert.equal(linked.body.sensors.temperature.connected, true);
+  assert.equal(linked.body.sensors.temperature.value, 25.1);
   assert.equal(linked.body.sensors.humidity.connected, true);
   assert.equal(linked.body.sensors.humidity.value, 58.6);
-  assert.equal(linked.body.sensors.temperature.value, 25.1);
+  assert.equal(linked.body.sensors.light.value, 1201);
   assert.equal(linked.body.sensors.soilMoisture.value, 61);
 
   const unlinked = await call('PATCH', `/api/plants/${plant.id}`, { blynkToken: '' });
